@@ -32,6 +32,7 @@ class UniBot(commands.Bot):
             "cogs.tweets",
             "cogs.portfolio",
             "cogs.faceit",
+            "cogs.status",
         ]
 
     # Belt and suspenders. Even if something calls process_commands, this never returns None.
