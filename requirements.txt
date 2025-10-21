@@ -1,0 +1,6 @@
+discord.py==2.4.0
+aiohttp>=3.9
+Pillow>=10.3
+python-dotenv>=1.0
+yfinance>=0.2.50
+PyYAML>=6.0
