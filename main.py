@@ -28,11 +28,11 @@ class UniBot(commands.Bot):
         super().__init__(command_prefix=slash_only_prefix, intents=intents)
         self.initial_extensions = [
             "cogs.basic",
-            "cogs.uptime",
             "cogs.tweets",
             "cogs.portfolio",
             "cogs.faceit",
             "cogs.status",
+            "cogs.lastfm",
         ]
 
     # Belt and suspenders. Even if something calls process_commands, this never returns None.
