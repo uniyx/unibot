@@ -4,7 +4,6 @@ import re
 import json
 import random
 import pathlib
-import time
 from typing import List, Optional, Tuple
 
 import discord
@@ -18,7 +17,8 @@ from discord.ext import commands
 DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
 GUILDS = app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
 
-TWEETS_JS_PATH = os.getenv("TWEETS_JS_PATH", "data/tweets.js")
+BASE_DIR = "/unibot"
+TWEETS_PATH = os.path.join(BASE_DIR, "data", "tweets.js")
 TWITTER_USERNAME = os.getenv("TWITTER_USERNAME", "").strip()
 
 _ASSIGNMENT_PREFIX = re.compile(r"^[^{\[]*=\s*", re.DOTALL)
@@ -120,7 +120,7 @@ class TweetsCog(commands.Cog):
         self.bot = bot
         if not TWITTER_USERNAME:
             raise RuntimeError("Set TWITTER_USERNAME in your environment")
-        self.archive = TweetArchive(TWEETS_JS_PATH)
+        self.archive = TweetArchive(TWEETS_PATH)
 
     @GUILDS
     @app_commands.command(

@@ -187,7 +187,7 @@ def humanize_range_label(start: dt.datetime, end: dt.datetime) -> str:
 
 
 class Portfolio(commands.Cog):
-    def __init__(self, bot: commands.Bot, default_file: str = "./data/portfolio.yaml"):
+    def __init__(self, bot: commands.Bot, default_file: str = "/mnt/shared/unibot/data/portfolio.yaml"):
         self.bot = bot
         self.default_file = default_file
         self.tz = dt.timezone.utc

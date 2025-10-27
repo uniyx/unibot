@@ -1,0 +1,26 @@
+services:
+  unibot:
+    container_name: unibot
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      TZ: America/New_York
+      HEALTH_PORT: 6969
+      INSTANCE_TAG: vm
+
+    ports:
+      - "6969:6969"
+
+    volumes:
+      - /mnt/shared/unibot:/unibot:ro
+
+    ulimits:
+      nofile:
+        soft: 8192
+        hard: 8192
