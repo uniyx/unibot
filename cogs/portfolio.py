@@ -1,4 +1,3 @@
-# cogs/portfolio.py
 import os
 import io
 import json
@@ -155,8 +154,8 @@ def ascii_line_chart(values: List[float], width: int = 70, height: int = 12, yla
             y0 = height - 1 - prev_y
             y1 = height - 1 - y
             if y0 != y1:
-                step = 1 if y1 > y0 else -1
-                for yy in range(y0 + step, y1, step):
+                step_dir = 1 if y1 > y0 else -1
+                for yy in range(y0 + step_dir, y1, step_dir):
                     if grid[yy][x] == " ":
                         grid[yy][x] = "│"
         prev_y = y
@@ -187,9 +186,28 @@ def humanize_range_label(start: dt.datetime, end: dt.datetime) -> str:
 
 
 class Portfolio(commands.Cog):
-    def __init__(self, bot: commands.Bot, default_file: str = "/mnt/shared/unibot/data/portfolio.yaml"):
+    """
+    Reads holdings from a YAML/JSON file that lives on the Samba share mounted into the container.
+
+    Default behavior:
+    - We try PORTFOLIO_FILE env var first.
+    - Fallback is /unibot/data/portfolio.yaml which should be bind-mounted from the host.
+    """
+
+    def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.default_file = default_file
+        # Prefer env so you can point at any mounted path without editing code.
+        env_path = os.getenv("PORTFOLIO_FILE", "").strip()
+        if env_path:
+            self.default_file = env_path
+        else:
+            # Fallback to the Samba-mounted path inside the container.
+            # You told me the file is /unibot/data/portfolio.yaml.
+            self.default_file = "/unibot/data/portfolio.yaml"
+
+        # Keep using UTC for now. If you care about US/Eastern consistency with markets,
+        # you can swap this to dt.timezone(dt.timedelta(hours=-4)) during DST etc.,
+        # or do zoneinfo("America/New_York") after Python 3.9+.
         self.tz = dt.timezone.utc
 
     @GUILDS
@@ -199,7 +217,7 @@ class Portfolio(commands.Cog):
     )
     @app_commands.describe(
         range_name="Time range",
-        file_path="Path to portfolio file (.yaml, .yml, .json)",
+        file_path="Override path to portfolio file (.yaml, .yml, .json)",
         normalize="Scale to start at 100",
         points="Chart width in points (20 to 160)"
     )
@@ -222,6 +240,7 @@ class Portfolio(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         path = file_path or self.default_file
+
         try:
             shares = await asyncio.get_running_loop().run_in_executor(None, load_portfolio, path)
         except Exception as e:
@@ -243,7 +262,7 @@ class Portfolio(commands.Cog):
             if df is None or df.empty or "Close" not in df.columns:
                 await interaction.followup.send(f"No price data for {sym} in the requested range.", ephemeral=True)
                 return
-            # Fixed: robust datetime conversion
+
             times = _to_utc_list(df.index, self.tz)
             closes = [float(x) if x == x else math.nan for x in df["Close"].tolist()]
             series_list.append((sym, times, closes))
