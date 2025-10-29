@@ -1,13 +1,11 @@
 import os
-import json
-import math
 import datetime as dt
 from zoneinfo import ZoneInfo
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Set
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 import aiohttp
 
 
@@ -26,14 +24,19 @@ PAGE_LIMIT = 100
 MAX_OFFSET_SAFETY = 600
 
 REQUEST_TIMEOUT = 15.0
-REQUEST_DELAY_SEC = 0.0  # set >0 to throttle pulls if FACEIT rate limits you
+REQUEST_DELAY_SEC = 0.0  # throttle if needed
 
 # Guild scoping
 DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
 def guilds_decorator():
-    # If DEV_GUILD_ID is set, scope commands to that guild only.
-    # Otherwise, leave them global (useful for prod once you really ship).
     return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
+
+############ ALERT CONFIG ############
+ROLE_ID = 1432855602224304258  # role to ping
+ALERT_CHANNEL_ID = 1430384084802211952  # channel
+ALERT_LEAD_MINUTES = 30               # how many minutes before match start to ping
+ALERT_LOOP_SECONDS = 60               # how often to poll upcoming matches
+######################################
 
 
 # =========================
@@ -44,7 +47,6 @@ def _fmt_safe(v: Any) -> str:
     if v is None:
         return "n/a"
     if isinstance(v, float):
-        # Keep two decimal places for ADR etc. Strip trailing zeros for neatness.
         s = f"{v:.2f}"
         s = s.rstrip("0").rstrip(".")
         return s
@@ -89,16 +91,21 @@ def _ts_to_local(ts_unix: Optional[int]) -> str:
     return local_dt.strftime("%Y-%m-%d %H:%M %Z")
 
 
+def _unix_to_dt_local(ts_unix: Optional[int]) -> Optional[dt.datetime]:
+    """
+    Convert unix timestamp to aware datetime in OUTPUT_TZ.
+    """
+    if ts_unix is None:
+        return None
+    base = dt.datetime.fromtimestamp(int(ts_unix), dt.timezone.utc)
+    return base.astimezone(ZoneInfo(OUTPUT_TZ))
+
+
 # =========================
 # FACEIT API CLIENT
 # =========================
 
 class EseaAPI:
-    """
-    Minimal async client for /esea and /upcoming.
-    Pulls upcoming and past matches for crescent, plus per-player stats.
-    """
-
     def __init__(self, session: aiohttp.ClientSession, api_key: str):
         self.session = session
         self.api_key = api_key.strip()
@@ -127,10 +134,6 @@ class EseaAPI:
         limit: int,
         offset: int,
     ) -> Dict[str, Any]:
-        """
-        match_type is "upcoming" or "past".
-        Returns decoded body (dict).
-        """
         url = f"{FACEIT_API_BASE}/championships/{CHAMPIONSHIP_ID}/matches"
         params = {
             "type": match_type,
@@ -140,10 +143,6 @@ class EseaAPI:
         return await self._get_json(url, params=params)
 
     async def collect_all_for_type(self, match_type: str) -> List[Dict[str, Any]]:
-        """
-        Paginate through all 'match_type' entries until we either get no more,
-        hit an error, or exceed MAX_OFFSET_SAFETY.
-        """
         all_items: List[Dict[str, Any]] = []
         offset = 0
 
@@ -171,9 +170,6 @@ class EseaAPI:
 
     @staticmethod
     def normalize_items(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        """
-        Flatten raw match dicts into structured rows.
-        """
         out: List[Dict[str, Any]] = []
         for raw in items:
             match_id = raw.get("match_id")
@@ -253,13 +249,9 @@ class EseaAPI:
 
     @staticmethod
     def extract_crescent_players_from_stats(stats_json: Dict[str, Any], team_id: str) -> List[Dict[str, Any]]:
-        """
-        Per-player stats for crescent for THIS MATCH ONLY across all maps,
-        with ADR weighted by per-map rounds.
-        """
         per_player: Dict[str, Dict[str, Any]] = {}
-
         rounds_list = stats_json.get("rounds") or []
+
         for mp in rounds_list:
             round_stats = mp.get("round_stats", {}) or {}
             map_rounds = _to_int(round_stats.get("Rounds"))
@@ -324,17 +316,11 @@ class EseaAPI:
                 "kpr": kpr_val,
             })
 
-        # At match level we sort by kills desc. Doesn't matter for final aggregate.
         out.sort(key=lambda r: (-r["kills"], r["nickname"].lower()))
         return out
 
     @staticmethod
     def aggregate_season_totals(per_match: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-        """
-        Roll up per-match player stats into season totals for crescent.
-        ADR is weighted by total rounds.
-        Sort the final dict by adr_overall DESC for leaderboard.
-        """
         agg: Dict[str, Dict[str, Any]] = {}
 
         for match_entry in per_match:
@@ -371,7 +357,6 @@ class EseaAPI:
                 if r > 0:
                     slot["adr_weighted_sum"] += adr_match_avg * r
 
-        # finalize
         for pid, slot in agg.items():
             kills_total = slot["kills"]
             deaths_total = slot["deaths"]
@@ -385,7 +370,6 @@ class EseaAPI:
 
             del slot["adr_weighted_sum"]
 
-        # sort players by ADR desc
         sorted_items = sorted(
             agg.items(),
             key=lambda kv: (-kv[1]["adr_overall"], kv[1]["nickname"].lower())
@@ -401,16 +385,31 @@ class EseaStats(commands.Cog):
     """
     /esea -> ADR sorted leaderboard for crescent in league play
     /upcoming -> next scheduled crescent matches
+
+    Background task:
+    - poll upcoming matches
+    - if any match starts in ~30 min, ping ROLE_ID in ALERT_CHANNEL_ID
     """
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
 
+        ############ alert state ############
+        # match_ids we've already pinged about
+        self.alerted_matches: Set[str] = set()
+        #####################################
+
+        # start background loop
+        self.match_alert_loop.start()
+
     async def cog_load(self) -> None:
         self.session = aiohttp.ClientSession()
 
     async def cog_unload(self) -> None:
+        # stop bg loop
+        self.match_alert_loop.cancel()
+
         if self.session and not self.session.closed:
             await self.session.close()
 
@@ -422,13 +421,6 @@ class EseaStats(commands.Cog):
         return EseaAPI(self.session, api_key)
 
     async def _collect_upcoming_and_stats(self) -> Tuple[List[Dict[str, Any]], Dict[str, Dict[str, Any]]]:
-        """
-        Shared pipeline:
-        - Fetch upcoming/past crescent matches
-        - Fetch per-match player stats for past
-        - Aggregate to season totals
-        Returns (upcoming_crescent_sorted, season_totals)
-        """
         api = await self._build_api()
 
         # upcoming
@@ -463,15 +455,109 @@ class EseaStats(commands.Cog):
             })
 
             if REQUEST_DELAY_SEC > 0:
-                # sleep without blocking
                 await discord.utils.sleep_until(
                     dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=REQUEST_DELAY_SEC)
                 )
 
-        # aggregate player stats across entire season
         season_totals = api.aggregate_season_totals(per_match_player_stats)
 
         return upcoming_crescent_sorted, season_totals
+
+    ############ BACKGROUND LOOP ############
+    @tasks.loop(seconds=ALERT_LOOP_SECONDS)
+    async def match_alert_loop(self):
+        """
+        Every ALERT_LOOP_SECONDS:
+        - fetch upcoming crescent matches
+        - find matches starting within ALERT_LEAD_MINUTES
+        - if not yet alerted, ping role in ALERT_CHANNEL_ID
+        """
+        # don't run until the bot is ready
+        if not self.bot.is_ready():
+            return
+
+        try:
+            api = await self._build_api()
+
+            all_upcoming_raw = await api.collect_all_for_type("upcoming")
+            upcoming_norm = api.normalize_items(all_upcoming_raw)
+            upcoming_crescent = api.filter_for_team(upcoming_norm, TEAM_ID)
+            upcoming_sorted = api.sort_upcoming(upcoming_crescent)
+
+            now_local = dt.datetime.now(ZoneInfo(OUTPUT_TZ))
+
+            for m in upcoming_sorted:
+                match_id = m.get("match_id")
+                sched_unix = m.get("scheduled_at_unix")
+                if not match_id or sched_unix is None:
+                    continue
+
+                sched_local = _unix_to_dt_local(sched_unix)
+                if sched_local is None:
+                    continue
+
+                # compute time delta
+                delta = sched_local - now_local
+                minutes_until = delta.total_seconds() / 60.0
+
+                # We alert if:
+                #   0 <= minutes_until <= ALERT_LEAD_MINUTES
+                #   and we haven't alerted this match yet
+                if 0 <= minutes_until <= ALERT_LEAD_MINUTES:
+                    if match_id not in self.alerted_matches:
+                        # build mention message
+                        # normalize team names so crescent appears first
+                        team_a = m["team_a_name"] or "Unknown"
+                        team_b = m["team_b_name"] or "Unknown"
+                        if team_a.lower() == "crescent":
+                            crescent_side = team_a
+                            opp_side = team_b
+                        elif team_b.lower() == "crescent":
+                            crescent_side = team_b
+                            opp_side = team_a
+                        else:
+                            crescent_side = team_a
+                            opp_side = team_b
+
+                        vs_text = f"{crescent_side} vs {opp_side}"
+                        room_url = m.get("match_url") or ""
+
+                        # timestamp pretty string
+                        pretty_when = _ts_to_local(sched_unix)
+
+                        channel = self.bot.get_channel(ALERT_CHANNEL_ID)
+                        if isinstance(channel, discord.TextChannel):
+                            # allow role mention explicitly
+                            role_mention = f"<@&{ROLE_ID}>"
+                            content = (
+                                f"{role_mention} Match in {int(round(minutes_until))} minutes.\n"
+                                f"{vs_text}\n"
+                                f"Start: {pretty_when}\n"
+                                f"{room_url}"
+                            )
+
+                            allowed = discord.AllowedMentions(
+                                roles=True,
+                                users=False,
+                                everyone=False,
+                            )
+
+                            try:
+                                await channel.send(content, allowed_mentions=allowed)
+                                self.alerted_matches.add(match_id)
+                            except Exception:
+                                # swallow exceptions so the loop keeps running
+                                pass
+
+        except Exception:
+            # swallow any fetch/parse failure so the loop does not die
+            return
+
+    @match_alert_loop.before_loop
+    async def before_match_alert_loop(self):
+        # wait until bot is ready before first iteration
+        await self.bot.wait_until_ready()
+    #########################################
 
     @guilds_decorator()
     @app_commands.command(
@@ -492,7 +578,6 @@ class EseaStats(commands.Cog):
 
         rows: List[Dict[str, Any]] = [v for _, v in totals.items()]
 
-        # Column widths
         name_w = max(5, max((len(r["nickname"]) for r in rows), default=5))
         mp_w   = max(2, len("MP"))
         kd_w   = max(4, len("KD"))
@@ -573,7 +658,6 @@ class EseaStats(commands.Cog):
             team_a = m["team_a_name"] or "Unknown"
             team_b = m["team_b_name"] or "Unknown"
 
-            # normalize perspective so crescent is always first
             if team_a.lower() == "crescent":
                 crescent_side = team_a
                 opp_side = team_b
@@ -581,16 +665,13 @@ class EseaStats(commands.Cog):
                 crescent_side = team_b
                 opp_side = team_a
             else:
-                # fallback in case Faceit renames us, just show A vs B
                 crescent_side = team_a
                 opp_side = team_b
 
             vs_text = f"{crescent_side} vs {opp_side}"
 
-            # Pretty time: "Thu Oct 30, 2025 21:30 EDT"
             pretty_when = m["when_local"]
             try:
-                # we originally formatted as "%Y-%m-%d %H:%M %Z"
                 raw_dt, raw_tz = pretty_when.rsplit(" ", 1)
                 raw_date, raw_time = raw_dt.split(" ")
                 year, month, day = raw_date.split("-")
@@ -605,14 +686,9 @@ class EseaStats(commands.Cog):
                 )
                 pretty_when = dt_obj.strftime("%a %b %d, %Y ") + f"{hour}:{minute} {raw_tz}"
             except Exception:
-                # leave pretty_when as-is if parsing fails
                 pass
 
             room_url = m["match_url"] or ""
-
-            # Bullet line:
-            # • Thu Oct 30, 2025 21:30 EDT crescent vs Unc Squad (hyperlink on matchup text)
-            # Discord supports [label](url) style in embeds.
             bullet_line = f"• {pretty_when} [{vs_text}]({room_url})"
             bullets.append(bullet_line)
 
