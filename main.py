@@ -70,10 +70,11 @@ class UniBot(commands.Bot):
         super().__init__(command_prefix=slash_only_prefix, intents=intents)
         self.initial_extensions = [
             "cogs.basic",
+            "cogs.status",
             "cogs.tweets",
             "cogs.portfolio",
             "cogs.faceit",
-            "cogs.status",
+            "cogs.esea",
             "cogs.lastfm",
         ]
 
