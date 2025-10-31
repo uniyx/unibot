@@ -77,6 +77,7 @@ class UniBot(commands.Bot):
             "cogs.esea",
             "cogs.esea2",
             "cogs.lastfm",
+            "cogs.cam"
         ]
 
     # Belt and suspenders. Even if something calls process_commands, this never returns None.
