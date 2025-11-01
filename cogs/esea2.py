@@ -1,4 +1,4 @@
-# cogs/esea.py
+# cogs/esea2.py
 import os
 from typing import Any, Dict, List, Optional, Tuple
 

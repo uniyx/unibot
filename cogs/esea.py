@@ -1,5 +1,6 @@
-# cogs/upcoming_only.py
+# cogs/esea.py
 import os
+import asyncio
 import datetime as dt
 from typing import Any, Dict, List, Optional, Tuple, Set
 
@@ -31,10 +32,9 @@ def guilds_decorator():
 ROLE_ID             = 1432855602224304258      # role to ping
 ALERT_CHANNEL_ID    = 1430384084802211952      # channel to send alerts
 ALERT_LEAD_MINUTES  = 30
-ALERT_LOOP_SECONDS  = 60
 
-REQUEST_TIMEOUT = 20.0
-
+REQUEST_TIMEOUT     = 20.0
+REFRESH_HOURS       = 3  # eight times a day
 
 # =========================
 # UTILITIES
@@ -45,6 +45,19 @@ def _ms_to_local(ms: Optional[int]) -> str:
     dtu = dt.datetime.fromtimestamp(int(ms) / 1000.0, dt.timezone.utc)
     return dtu.astimezone(ZoneInfo(OUTPUT_TZ)).strftime("%a %b %d, %Y %H:%M %Z")
 
+def _to_local_dt(ms: int) -> dt.datetime:
+    return dt.datetime.fromtimestamp(ms / 1000.0, dt.timezone.utc).astimezone(ZoneInfo(OUTPUT_TZ))
+
+def _fmt_delta(seconds: float) -> str:
+    sign = "-" if seconds < 0 else ""
+    s = abs(int(seconds))
+    h, r = divmod(s, 3600)
+    m, s = divmod(r, 60)
+    if h:
+        return f"{sign}{h}h {m}m {s}s"
+    if m:
+        return f"{sign}{m}m {s}s"
+    return f"{sign}{s}s"
 
 # =========================
 # FACEIT CLIENT (Public v1 only)
@@ -72,7 +85,7 @@ class FaceitV1Client:
             }
             url = f"{FACEIT_PUBLIC_V1}/championships/v1/matches"
             async with self.session.get(url, params=params, headers=self._headers(), timeout=REQUEST_TIMEOUT) as resp:
-                if resp.status == 404:
+                if resp.status in (404, 400):
                     break
                 if resp.status != 200:
                     break
@@ -84,15 +97,12 @@ class FaceitV1Client:
                 if len(page) < limit:
                     break
                 offset += limit
-        # ASC by schedule for determinism
         items.sort(key=lambda m: (m.get("origin", {}).get("schedule", 0)))
         return items
 
     async def team_name(self, team_id: str) -> str:
         if team_id in self._name_cache:
             return self._name_cache[team_id]
-
-        # Try both public shapes
         for path in (f"/teams/v1/teams/{team_id}", f"/teams/v1/teams/{team_id}/profile"):
             url = f"{FACEIT_PUBLIC_V1}{path}"
             try:
@@ -110,7 +120,6 @@ class FaceitV1Client:
                         return name
             except Exception:
                 continue
-
         self._name_cache[team_id] = team_id
         return team_id
 
@@ -163,45 +172,135 @@ class FaceitV1Client:
         out.sort(key=lambda x: (x["scheduled_ms"] is None, x["scheduled_ms"]))
         return out
 
-
 # =========================
 # DISCORD COG
 # =========================
 class EseaUpcoming(commands.Cog):
     """
-    Plain cog: /upcoming and an alert loop driven by the public participant feed.
+    No minute polling of FACEIT. Fetch on a slow cadence and schedule one-shot alerts per match.
+    Includes /upcoming to render matches and /alerts to inspect scheduled alert countdowns.
     """
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
-        self.alerted_matches: Set[str] = set()
+        self._api: Optional[FaceitV1Client] = None
+        # match_id -> asyncio.Task
+        self._scheduled: Dict[str, asyncio.Task] = {}
+        # match_id -> metadata for debugging output
+        self._scheduled_meta: Dict[str, Dict[str, Any]] = {}
 
     async def cog_load(self) -> None:
         self.session = aiohttp.ClientSession()
-        self.match_alert_loop.start()
+        self._api = FaceitV1Client(self.session)
+        # initial reconcile and start the slow producer
+        await self._reconcile_schedule()
+        self.upcoming_refresh_loop.start()
 
     async def cog_unload(self) -> None:
-        self.match_alert_loop.cancel()
+        self.upcoming_refresh_loop.cancel()
+        for t in list(self._scheduled.values()):
+            t.cancel()
+        self._scheduled.clear()
+        self._scheduled_meta.clear()
         if self.session and not self.session.closed:
             await self.session.close()
 
-    async def _api(self) -> FaceitV1Client:
-        assert self.session is not None
-        return FaceitV1Client(self.session)
+    def _alert_time_seconds(self, sched_ms: int) -> float:
+        alert_at = _to_local_dt(sched_ms) - dt.timedelta(minutes=ALERT_LEAD_MINUTES)
+        return (alert_at - dt.datetime.now(ZoneInfo(OUTPUT_TZ))).total_seconds()
+
+    def _schedule_alert_if_needed(self, match: Dict[str, Any]) -> None:
+        match_id = match.get("match_id")
+        sched_ms = match.get("scheduled_ms")
+        if not match_id or not sched_ms:
+            return
+
+        existing = self._scheduled.get(match_id)
+        seconds_until = self._alert_time_seconds(sched_ms)
+
+        # too late by >10 min: cancel any existing task/meta and skip
+        if seconds_until < -600:
+            t = self._scheduled.pop(match_id, None)
+            if t and not t.done():
+                t.cancel()
+            self._scheduled_meta.pop(match_id, None)
+            return
+
+        # refresh metadata for debugging
+        self._scheduled_meta[match_id] = {
+            "scheduled_ms": sched_ms,
+            "scheduled_local": match.get("scheduled_local", "TBD"),
+            "opponent_name": match.get("opponent_name", "Unknown"),
+            "match_url": match.get("match_url", ""),
+        }
+
+        async def _wait_and_ping():
+            try:
+                if seconds_until > 0:
+                    await asyncio.sleep(seconds_until)
+                channel = self.bot.get_channel(ALERT_CHANNEL_ID)
+                if isinstance(channel, discord.TextChannel):
+                    role_mention = f"<@&{ROLE_ID}>"
+                    content = (
+                        f"{role_mention} Match in {ALERT_LEAD_MINUTES} minutes.\n"
+                        f"crescent vs {match.get('opponent_name', 'Unknown')}\n"
+                        f"Start: {match.get('scheduled_local', 'TBD')}\n"
+                        f"{match.get('match_url', '')}"
+                    )
+                    allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
+                    await channel.send(content, allowed_mentions=allowed)
+            except asyncio.CancelledError:
+                return
+            except Exception:
+                return
+            finally:
+                self._scheduled.pop(match_id, None)
+                self._scheduled_meta.pop(match_id, None)
+
+        # reschedule if a task exists
+        if existing and not existing.done():
+            existing.cancel()
+            self._scheduled.pop(match_id, None)
+
+        task = asyncio.create_task(_wait_and_ping(), name=f"esea_alert_{match_id}")
+        self._scheduled[match_id] = task
+
+    async def _reconcile_schedule(self) -> None:
+        """Fetch upcoming list once and reconcile alert tasks."""
+        if not self._api:
+            return
+        try:
+            upcoming = await self._api.upcoming_created(TEAM_ID, CHAMPIONSHIP_ID)
+        except Exception:
+            return
+
+        seen_ids: Set[str] = set()
+        for m in upcoming:
+            mid = m.get("match_id", "")
+            seen_ids.add(mid)
+            self._schedule_alert_if_needed(m)
+
+        # cancel tasks for matches no longer upcoming
+        for mid, task in list(self._scheduled.items()):
+            if mid not in seen_ids:
+                task.cancel()
+                self._scheduled.pop(mid, None)
+                self._scheduled_meta.pop(mid, None)
 
     # ---------- Slash: /upcoming ----------
     @guilds_decorator()
     @app_commands.command(
         name="upcoming",
-        description="Next scheduled crescent league matches (from public feed)"
+        description="Next scheduled crescent league matches (also reconciles alert scheduling)"
     )
     async def upcoming(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
+        assert self._api is not None
         try:
-            api = await self._api()
-            upcoming = await api.upcoming_created(TEAM_ID, CHAMPIONSHIP_ID)
-            crescent_w, crescent_l = await api.compute_record(TEAM_ID, CHAMPIONSHIP_ID)
+            await self._reconcile_schedule()
+            upcoming = await self._api.upcoming_created(TEAM_ID, CHAMPIONSHIP_ID)
+            crescent_w, crescent_l = await self._api.compute_record(TEAM_ID, CHAMPIONSHIP_ID)
         except Exception as e:
             await interaction.followup.send(f"Error fetching data: {e}", ephemeral=True)
             return
@@ -214,13 +313,10 @@ class EseaUpcoming(commands.Cog):
         for m in upcoming:
             opp_id = m["opponent_id"]
             opp_name = m["opponent_name"] or "Unknown"
-            # opponent record
-            opp_w = opp_l = 0
             try:
-                if opp_id:
-                    opp_w, opp_l = await api.compute_record(opp_id, CHAMPIONSHIP_ID)
+                opp_w, opp_l = await self._api.compute_record(opp_id, CHAMPIONSHIP_ID)
             except Exception:
-                pass
+                opp_w = opp_l = 0
 
             bullets.append(
                 f"• {m['scheduled_local']} [crescent ({crescent_w}W - {crescent_l}L) vs {opp_name} ({opp_w}W - {opp_l}L)]({m['match_url']})"
@@ -234,52 +330,61 @@ class EseaUpcoming(commands.Cog):
         embed.set_footer(text="Times shown in " + OUTPUT_TZ)
         await interaction.followup.send(embed=embed)
 
-    # ---------- Background alert loop ----------
-    @tasks.loop(seconds=ALERT_LOOP_SECONDS)
-    async def match_alert_loop(self):
+    # ---------- Slash: /alerts ----------
+    @guilds_decorator()
+    @app_commands.command(
+        name="alerts",
+        description="Debug: show which matches currently have an alert scheduled"
+    )
+    @app_commands.describe(refresh="If true, fetch FACEIT now to reconcile before listing.")
+    async def alerts(self, interaction: discord.Interaction, refresh: Optional[bool] = False):
+        await interaction.response.defer(thinking=True)
+        if refresh:
+            try:
+                await self._reconcile_schedule()
+            except Exception as e:
+                await interaction.followup.send(f"Reconcile failed: {e}", ephemeral=True)
+                return
+
+        if not self._scheduled_meta:
+            await interaction.followup.send("No alert tasks are currently scheduled.", ephemeral=True)
+            return
+
+        # Sort by alert fire time
+        items: List[Tuple[int, str]] = []  # (unix_alert_ts, opponent_name)
+        for meta in self._scheduled_meta.values():
+            ms = meta.get("scheduled_ms")
+            if isinstance(ms, int):
+                alert_dt = _to_local_dt(ms) - dt.timedelta(minutes=ALERT_LEAD_MINUTES)
+                items.append((int(alert_dt.timestamp()), str(meta.get("opponent_name", "Unknown"))))
+
+        if not items:
+            await interaction.followup.send("No alert tasks are currently scheduled.", ephemeral=True)
+            return
+
+        items.sort(key=lambda x: x[0])
+        lines = [f"• {opp} <t:{unix}:R>" for unix, opp in items]
+
+        embed = discord.Embed(
+            title=f"{TITLE_BASE} • alert countdowns",
+            description="\n".join(lines),
+            color=THEME_COLOR
+        )
+        embed.set_footer(text=f"Lead time {ALERT_LEAD_MINUTES} min • tasks={len(items)} • Times shown via Discord relative timestamps")
+
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+    # ---------- Background: slow producer that detects new/changed matches ----------
+    @tasks.loop(hours=REFRESH_HOURS)
+    async def upcoming_refresh_loop(self):
         if not self.bot.is_ready():
             return
-        try:
-            api = await self._api()
-            upcoming = await api.upcoming_created(TEAM_ID, CHAMPIONSHIP_ID)
+        await self._reconcile_schedule()
 
-            now_local = dt.datetime.now(ZoneInfo(OUTPUT_TZ))
-            for m in upcoming:
-                match_id = m.get("match_id")
-                sched_ms = m.get("scheduled_ms")
-                if not match_id or not sched_ms:
-                    continue
-
-                sched_local = dt.datetime.fromtimestamp(sched_ms / 1000.0, dt.timezone.utc).astimezone(ZoneInfo(OUTPUT_TZ))
-                minutes_until = (sched_local - now_local).total_seconds() / 60.0
-
-                if 0 <= minutes_until <= ALERT_LEAD_MINUTES and match_id not in self.alerted_matches:
-                    vs_text = f"crescent vs {m.get('opponent_name', 'Unknown')}"
-                    room_url = m.get("match_url", "")
-                    pretty_when = m.get("scheduled_local", "TBD")
-
-                    channel = self.bot.get_channel(ALERT_CHANNEL_ID)
-                    if isinstance(channel, discord.TextChannel):
-                        role_mention = f"<@&{ROLE_ID}>"
-                        content = (
-                            f"{role_mention} Match in {int(round(minutes_until))} minutes.\n"
-                            f"{vs_text}\n"
-                            f"Start: {pretty_when}\n"
-                            f"{room_url}"
-                        )
-                        allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
-                        try:
-                            await channel.send(content, allowed_mentions=allowed)
-                            self.alerted_matches.add(match_id)
-                        except Exception:
-                            pass
-        except Exception:
-            return
-
-    @match_alert_loop.before_loop
-    async def before_match_alert_loop(self):
+    @upcoming_refresh_loop.before_loop
+    async def before_upcoming_refresh_loop(self):
         await self.bot.wait_until_ready()
-
+        await self._reconcile_schedule()
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(EseaUpcoming(bot))
