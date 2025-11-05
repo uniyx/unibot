@@ -17,6 +17,8 @@ FACEIT_BASE = "https://open.faceit.com/data/v4"
 KD_KEYS = ["Average K/D Ratio", "K/D Ratio", "K/D"]
 ADR_KEYS = ["Average Damage/Round", "ADR", "Average Damage per Round"]
 
+THEME_COLOR = 0xFF5500
+
 # Replace with exact FACEIT nicknames
 ROSTER: List[str] = [
     "uni",
@@ -250,7 +252,7 @@ class FaceitStats(commands.Cog):
         embed = discord.Embed(
             title="FACEIT CS2 Leaderboard",
             description="```text\n" + "\n".join(lines) + "\n```",
-            color=0x2F3136
+            color=THEME_COLOR
         )
         if links:
             embed.add_field(name="Profiles", value=" • ".join(links), inline=False)
@@ -517,12 +519,11 @@ class FaceitStats(commands.Cog):
 
         # Title includes scope
         title = f"FACEIT CS2 Leaderboard • {scope_label}"
-        color = 0x2F3136
 
         embed = discord.Embed(
             title=title,
             description="```text\n" + "\n".join(lines) + "\n```",
-            color=color,
+            color=THEME_COLOR,
         )
         if links:
             embed.add_field(name="Profiles", value=" • ".join(links), inline=False)

@@ -78,9 +78,9 @@ def pick_emoji(delta: float) -> str:
 
 def _color_for_delta(delta: float) -> discord.Color:
     if delta > 0:
-        return discord.Color.green()
+        return 0x00C807
     if delta < 0:
-        return discord.Color.red()
+        return 0xFF5000
     return discord.Color.dark_grey()
 
 

@@ -36,6 +36,10 @@ ALERT_LEAD_MINUTES  = 30
 REQUEST_TIMEOUT     = 20.0
 REFRESH_HOURS       = 3  # eight times a day
 
+# Idempotency controls
+ALERT_GRACE_SECONDS = 90          # after fire time, do not send again past this window
+RESCHEDULE_JITTER_S = 2           # if an existing task is due within this, keep it
+
 # =========================
 # UTILITIES
 # =========================
@@ -177,23 +181,27 @@ class FaceitV1Client:
 # =========================
 class EseaUpcoming(commands.Cog):
     """
-    No minute polling of FACEIT. Fetch on a slow cadence and schedule one-shot alerts per match.
-    Includes /upcoming to render matches and /alerts to inspect scheduled alert countdowns.
+    Slow producer that reconciles upcoming matches and schedules one-shot alerts.
     """
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.session: Optional[aiohttp.ClientSession] = None
         self._api: Optional[FaceitV1Client] = None
+
         # match_id -> asyncio.Task
         self._scheduled: Dict[str, asyncio.Task] = {}
-        # match_id -> metadata for debugging output
+        # match_id -> metadata for debug
         self._scheduled_meta: Dict[str, Dict[str, Any]] = {}
+        # match_id -> unix seconds when we sent the alert
+        self._fired: Dict[str, int] = {}
+
+        # mutex to guard double send in racy reschedules
+        self._send_lock = asyncio.Lock()
 
     async def cog_load(self) -> None:
         self.session = aiohttp.ClientSession()
         self._api = FaceitV1Client(self.session)
-        # initial reconcile and start the slow producer
         await self._reconcile_schedule()
         self.upcoming_refresh_loop.start()
 
@@ -216,18 +224,20 @@ class EseaUpcoming(commands.Cog):
         if not match_id or not sched_ms:
             return
 
-        existing = self._scheduled.get(match_id)
         seconds_until = self._alert_time_seconds(sched_ms)
+        now_unix = int(dt.datetime.now(ZoneInfo(OUTPUT_TZ)).timestamp())
 
-        # too late by >10 min: cancel any existing task/meta and skip
-        if seconds_until < -600:
-            t = self._scheduled.pop(match_id, None)
-            if t and not t.done():
-                t.cancel()
+        # Already fired or far past the window: do nothing
+        if match_id in self._fired:
+            return
+        if seconds_until < -ALERT_GRACE_SECONDS:
+            # Mark as fired so we will not chase it anymore
+            self._fired[match_id] = now_unix
+            self._scheduled.pop(match_id, None)
             self._scheduled_meta.pop(match_id, None)
             return
 
-        # refresh metadata for debugging
+        # Refresh metadata for debug
         self._scheduled_meta[match_id] = {
             "scheduled_ms": sched_ms,
             "scheduled_local": match.get("scheduled_local", "TBD"),
@@ -235,21 +245,27 @@ class EseaUpcoming(commands.Cog):
             "match_url": match.get("match_url", ""),
         }
 
-        async def _wait_and_ping():
+        async def _wait_and_ping(initial_delay: float):
             try:
-                if seconds_until > 0:
-                    await asyncio.sleep(seconds_until)
-                channel = self.bot.get_channel(ALERT_CHANNEL_ID)
-                if isinstance(channel, discord.TextChannel):
-                    role_mention = f"<@&{ROLE_ID}>"
-                    content = (
-                        f"{role_mention} Match in {ALERT_LEAD_MINUTES} minutes.\n"
-                        f"crescent vs {match.get('opponent_name', 'Unknown')}\n"
-                        f"Start: {match.get('scheduled_local', 'TBD')}\n"
-                        f"{match.get('match_url', '')}"
-                    )
-                    allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
-                    await channel.send(content, allowed_mentions=allowed)
+                if initial_delay > 0:
+                    await asyncio.sleep(initial_delay)
+
+                async with self._send_lock:
+                    # Double check idempotency at the send site
+                    if match_id in self._fired:
+                        return
+                    channel = self.bot.get_channel(ALERT_CHANNEL_ID)
+                    if isinstance(channel, discord.TextChannel):
+                        role_mention = f"<@&{ROLE_ID}>"
+                        content = (
+                            f"{role_mention} Match in {ALERT_LEAD_MINUTES} minutes.\n"
+                            f"crescent vs {match.get('opponent_name', 'Unknown')}\n"
+                            f"Start: {match.get('scheduled_local', 'TBD')}\n"
+                            f"{match.get('match_url', '')}"
+                        )
+                        allowed = discord.AllowedMentions(roles=True, users=False, everyone=False)
+                        await channel.send(content, allowed_mentions=allowed)
+                        self._fired[match_id] = int(dt.datetime.now(ZoneInfo(OUTPUT_TZ)).timestamp())
             except asyncio.CancelledError:
                 return
             except Exception:
@@ -258,16 +274,22 @@ class EseaUpcoming(commands.Cog):
                 self._scheduled.pop(match_id, None)
                 self._scheduled_meta.pop(match_id, None)
 
-        # reschedule if a task exists
+        # If a task exists and is about to fire, keep it to avoid churn
+        existing = self._scheduled.get(match_id)
         if existing and not existing.done():
+            # If the remaining time is essentially the same, do not replace
+            # Otherwise, replace with the new timing
+            # We cannot read its remaining time directly, so use a small jitter rule
+            if abs(seconds_until) <= RESCHEDULE_JITTER_S:
+                return
             existing.cancel()
             self._scheduled.pop(match_id, None)
 
-        task = asyncio.create_task(_wait_and_ping(), name=f"esea_alert_{match_id}")
+        delay = max(seconds_until, 0.0)
+        task = asyncio.create_task(_wait_and_ping(delay), name=f"esea_alert_{match_id}")
         self._scheduled[match_id] = task
 
     async def _reconcile_schedule(self) -> None:
-        """Fetch upcoming list once and reconcile alert tasks."""
         if not self._api:
             return
         try:
@@ -287,6 +309,12 @@ class EseaUpcoming(commands.Cog):
                 task.cancel()
                 self._scheduled.pop(mid, None)
                 self._scheduled_meta.pop(mid, None)
+
+        # garbage collect fired entries older than 24 hours
+        cutoff = int((dt.datetime.now(ZoneInfo(OUTPUT_TZ)) - dt.timedelta(hours=24)).timestamp())
+        for mid, ts in list(self._fired.items()):
+            if ts < cutoff and mid not in seen_ids:
+                self._fired.pop(mid, None)
 
     # ---------- Slash: /upcoming ----------
     @guilds_decorator()
@@ -350,8 +378,7 @@ class EseaUpcoming(commands.Cog):
             await interaction.followup.send("No alert tasks are currently scheduled.", ephemeral=True)
             return
 
-        # Sort by alert fire time
-        items: List[Tuple[int, str]] = []  # (unix_alert_ts, opponent_name)
+        items: List[Tuple[int, str]] = []
         for meta in self._scheduled_meta.values():
             ms = meta.get("scheduled_ms")
             if isinstance(ms, int):
@@ -374,7 +401,7 @@ class EseaUpcoming(commands.Cog):
 
         await interaction.followup.send(embed=embed, ephemeral=True)
 
-    # ---------- Background: slow producer that detects new/changed matches ----------
+    # ---------- Background ----------
     @tasks.loop(hours=REFRESH_HOURS)
     async def upcoming_refresh_loop(self):
         if not self.bot.is_ready():
