@@ -13,6 +13,7 @@ import aiohttp
 OUTPUT_TZ       = "America/New_York"
 TEAM_ID         = "15c9a36f-8169-49eb-a41b-0a0e7567ed37"      # crescent
 CHAMPIONSHIP_ID = "c5749517-d0b9-4d12-aec1-329393db934b"      # ESEA S55 NA Main Central
+DIVISION_ID     = "cc06fdac-f0c6-487e-8d9d-b2ca94789184"      # division used by placements API
 
 # =========================
 # ENDPOINTS
@@ -117,6 +118,44 @@ def _compute_record_from_fixtures(fixtures: List[Dict[str, Any]], team_id: str) 
         else:
             l += 1
     return w, l
+
+# ---------------- Placements (public v1) ----------------
+async def _fetch_division_placement(
+    session: aiohttp.ClientSession,
+    division_id: str,
+    premade_team_id: str,
+) -> Optional[Dict[str, Any]]:
+    """
+    Reads https://www.faceit.com/api/team-leagues/v1/placements?divisionId=...
+    Expected shape:
+      { "payload": { "placements": [ { placement, won, lost, points, buchholz, teams: [ { premade_team_id, ... } ] }, ... ] } }
+
+    Returns a dict with placement, won, lost, points, buchholz for the entry whose teams[].premade_team_id == premade_team_id.
+    Falls back to None if not found.
+    """
+    url = f"{V1_BASE}/team-leagues/v1/placements"
+    params = {"divisionId": division_id}
+    async with session.get(url, params=params, headers=_v1_headers(), timeout=REQUEST_TIMEOUT) as resp:
+        if resp.status != 200:
+            return None
+        data = await resp.json()
+
+    placements = (((data or {}).get("payload") or {}).get("placements") or [])
+    if not isinstance(placements, list):
+        return None
+
+    for e in placements:
+        for t in (e.get("teams") or []):
+            if str(t.get("premade_team_id")) == str(premade_team_id):
+                return {
+                    "placement": _to_int(e.get("placement")),
+                    "won": _to_int(e.get("won")),
+                    "lost": _to_int(e.get("lost")),
+                    "points": _to_int(e.get("points")),
+                    "buchholz": _to_int(e.get("buchholz")),
+                }
+    return None
+
 
 # ---------------- Open v4 match stats ----------------
 async def _fetch_match_stats(session: aiohttp.ClientSession, match_id: str) -> Dict[str, Any]:
@@ -272,7 +311,7 @@ def _render_table(agg: Dict[str, Dict[str, Any]]) -> str:
 # =========================
 class EseaStats(commands.Cog):
     """
-    /esea -> Aggregated season totals for crescent. Title includes W - L.
+    /esea -> Aggregated season totals for crescent. Title includes placement and W - L.
     """
 
     def __init__(self, bot: commands.Bot):
@@ -289,7 +328,7 @@ class EseaStats(commands.Cog):
     @guilds_decorator()
     @app_commands.command(
         name="esea",
-        description="crescent ESEA season stats (ADR, KD, HS%, KPR) with record in title"
+        description="crescent ESEA season stats (ADR, KD, HS%, KPR) with placement and record in title"
     )
     async def esea(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
@@ -314,9 +353,33 @@ class EseaStats(commands.Cog):
 
         crescent_w, crescent_l = _compute_record_from_fixtures(fixtures, TEAM_ID)
 
+        # 1b) placement from division endpoint
+        placement_tag = ""
+        try:
+            placement_info = await _fetch_division_placement(self.session, DIVISION_ID, TEAM_ID)
+            if placement_info:
+                placement_val = placement_info.get("placement", 0)
+                won_api = placement_info.get("won", None)
+                lost_api = placement_info.get("lost", None)
+                # Prefer API W/L if present and sensible
+                if isinstance(won_api, int) and isinstance(lost_api, int) and (won_api + lost_api) >= (crescent_w + crescent_l):
+                    crescent_w, crescent_l = won_api, lost_api
+                if placement_val:
+                    placement_tag = f"#{placement_val}"
+        except Exception:
+            placement_tag = ""
+
+        def build_title(w: int, l: int, placement_txt: str) -> str:
+            parts: List[str] = []
+            if placement_txt:
+                parts.append(placement_txt)
+            parts.append(f"{w}W - {l}L")
+            inside = " • ".join(parts)
+            return f"{TITLE_BASE} ({inside}) • ESEA Main stats"
+
         if not fixtures:
             embed = discord.Embed(
-                title=f"{TITLE_BASE} ({crescent_w}W - {crescent_l}L) • ESEA Main stats",
+                title=build_title(crescent_w, crescent_l, placement_tag),
                 description="No finished matches found for this season.",
                 color=THEME_COLOR,
             )
@@ -340,7 +403,7 @@ class EseaStats(commands.Cog):
         totals = _aggregate_totals(per_match)
         if not totals:
             embed = discord.Embed(
-                title=f"{TITLE_BASE} ({crescent_w}W - {crescent_l}L) • ESEA Main stats",
+                title=build_title(crescent_w, crescent_l, placement_tag),
                 description="No season stats available yet.",
                 color=THEME_COLOR,
             )
@@ -349,7 +412,7 @@ class EseaStats(commands.Cog):
 
         table = _render_table(totals)
         embed = discord.Embed(
-            title=f"{TITLE_BASE} ({crescent_w}W - {crescent_l}L) • ESEA Main stats",
+            title=build_title(crescent_w, crescent_l, placement_tag),
             description=table,
             color=THEME_COLOR
         )
