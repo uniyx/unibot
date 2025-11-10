@@ -76,6 +76,7 @@ class UniBot(commands.Bot):
             "cogs.faceit",
             "cogs.esea",
             "cogs.esea2",
+            "cogs.dm",
             "cogs.lastfm",
             "cogs.cam"
         ]
