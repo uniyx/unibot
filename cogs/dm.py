@@ -22,7 +22,13 @@ def guilds_decorator():
 # CONFIG
 # =========================
 REGION = "na"
-SERVER = "na_na_chi_mirage19rifles"
+
+# Support multiple servers
+SERVERS: List[str] = [
+    "na_na_chi_mirage19rifles",
+    "na_na_chi_dust2rifles",
+]
+
 RANK_START = 1
 PLAYERS = 100
 
@@ -106,14 +112,12 @@ def parse_rankings_html(html: str) -> List[Dict]:
         if len(tds) < 6:
             continue
 
-        # Rank
         rank_text = _clean_text(_strip_tags(tds[0]))
         try:
             rank = int(rank_text)
         except Exception:
             continue
 
-        # Player cell: SteamID and nickname
         player_cell = tds[1]
         steamid = None
         m = A_STEAM_RE.search(player_cell)
@@ -125,7 +129,6 @@ def parse_rankings_html(html: str) -> List[Dict]:
         if n:
             nickname = _clean_text(_strip_tags(n.group(1)))
 
-        # Monthly kills
         km = _parse_int_with_spaces(_clean_text(_strip_tags(tds[MONTHLY_KILLS_COL_IDX])))
 
         rows.append(
@@ -139,12 +142,12 @@ def parse_rankings_html(html: str) -> List[Dict]:
     return rows
 
 # =========================
-# FETCH
+# FETCH (CONCURRENT, MULTI-SERVER)
 # =========================
-async def fetch_rankings(session: aiohttp.ClientSession) -> str:
+async def fetch_rankings_for_server(session: aiohttp.ClientSession, server: str) -> str:
     url = (
         "https://www.warmupserver.net/rankings.php"
-        f"?region={REGION}&server={SERVER}&rank={RANK_START}&players={PLAYERS}"
+        f"?region={REGION}&server={server}&rank={RANK_START}&players={PLAYERS}"
     )
     for attempt in range(5):
         try:
@@ -155,7 +158,7 @@ async def fetch_rankings(session: aiohttp.ClientSession) -> str:
         except Exception:
             pass
         await asyncio.sleep(min(1.5 * (2 ** attempt), 8.0))
-    raise RuntimeError("Failed to fetch rankings after retries")
+    raise RuntimeError(f"Failed to fetch rankings for {server} after retries")
 
 # =========================
 # COMPUTE
@@ -165,15 +168,11 @@ def compute_today_target(now_local: dt.datetime) -> int:
     return target if target < MONTHLY_GOAL_KILLS else MONTHLY_GOAL_KILLS
 
 def _progress_bar(current: int, goal: int, width: int = 16) -> str:
-    """
-    Unicode progress bar using block chars. Returns a fixed-width bar.
-    """
     ratio = 0.0 if goal <= 0 else min(max(current / goal, 0.0), 1.0)
     filled = int(round(ratio * width))
     if filled > width:
         filled = width
-    bar = "█" * filled + "░" * (width - filled)
-    return bar
+    return "█" * filled + "░" * (width - filled)
 
 def _delta_emoji(delta: int) -> str:
     if delta > 0:
@@ -185,21 +184,19 @@ def _delta_emoji(delta: int) -> str:
 def _medal(rank: int) -> str:
     return {1: "🥇", 2: "🥈", 3: "🥉"}.get(rank, "🏁")
 
-def format_table_pretty(rows: List[Tuple[str, int, int, int]]) -> str:
+def format_table_pretty(rows: List[Tuple[str, int, int, int]], server_count: int, now: dt.datetime) -> str:
     """
     rows: list of (label, kills, pct_done, delta_vs_today)
-    Pretty table with emojis, a progress bar, and aligned numeric columns.
-    Sorted preview (by kills) medals shown, but display order remains configured order.
     """
-    # Compute medals based on kills among tracked players
     sorted_by_kills = sorted(rows, key=lambda r: r[1], reverse=True)
     label_to_medal: Dict[str, str] = {name: _medal(i + 1) for i, (name, _, _, _) in enumerate(sorted_by_kills)}
 
     name_w = max(5, max(len(r[0]) for r in rows) if rows else 5)
-    # Header
-    header = f"**🏆 Warmup Monthly Progress**\n" \
-             f"Goal: **{MONTHLY_GOAL_KILLS}** • Target/day: **{DAILY_TARGET_KILLS}**\n\n"
-    # Table header in code block for alignment
+    header = (
+        f"**🏆 Warmup Monthly Progress**\n"
+        f"Servers: **{server_count}** • Goal: **{MONTHLY_GOAL_KILLS}** • Target/day: **{DAILY_TARGET_KILLS}** • "
+        f"{now.strftime('%a %b %d, %Y %H:%M %Z')}\n\n"
+    )
     title_line = f"{'Player':{name_w}}  {'Kills':>6}  {'%':>3}  {'Δ':>5}  {'Progress':<{16}}"
     sep_line = "-" * len(title_line)
     lines = [title_line, sep_line]
@@ -207,27 +204,23 @@ def format_table_pretty(rows: List[Tuple[str, int, int, int]]) -> str:
         medal = label_to_medal.get(name, "🏁")
         delta_mark = _delta_emoji(delta)
         bar = _progress_bar(kills, MONTHLY_GOAL_KILLS, width=16)
-        # Keep numbers monospaced and add emojis inline
-        lines.append(
-            f"{medal} {name:{name_w}}  {kills:6d}  {pct_done:3d}  {delta_mark}{delta:+4d}  {bar}"
-        )
-    codeblock = "```\n" + "\n".join(lines) + "\n```"
-    return header + codeblock
+        lines.append(f"{medal} {name:{name_w}}  {kills:6d}  {pct_done:3d}  {delta_mark}{delta:+4d}  {bar}")
+    return "```\n" + "\n".join(lines) + "\n```"
 
 # =========================
 # COG
 # =========================
 class dm(commands.Cog):
     """
-    /dm: monthly kills for configured SteamIDs vs a 6,000 goal and day-of-month schedule.
-    Prefers nickname from WarmupServer HTML; falls back to hardcoded names; then to ID tail.
+    /dm: aggregate monthly kills for configured SteamIDs across multiple servers,
+    vs a 6,000 goal and day-of-month schedule. Prefers nickname from HTML; falls back to hardcoded names; then ID tail.
     """
 
     def __init__(self, bot: commands.Bot):
         self.bot = bot
 
     @guilds_decorator()
-    @app_commands.command(name="dm", description="Monthly WarmupServer kill progress for configured Steam profiles.")
+    @app_commands.command(name="dm", description="Aggregated monthly WarmupServer kill progress for configured Steam profiles.")
     async def dm(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
 
@@ -235,39 +228,47 @@ class dm(commands.Cog):
         today_target = compute_today_target(now)
 
         async with aiohttp.ClientSession() as session:
-            html = await fetch_rankings(session)
-        parsed = parse_rankings_html(html)
+            html_pages = await asyncio.gather(
+                *[fetch_rankings_for_server(session, server) for server in SERVERS],
+                return_exceptions=True,
+            )
 
-        # Build lookup from SteamID to (nickname_from_html, kills)
-        html_data: Dict[str, Tuple[Optional[str], int]] = {}
-        for row in parsed:
-            sid = row.get("steamid64")
-            if not sid:
-                continue
-            km = row.get("kills_month")
-            if km is None:
-                continue
-            html_data[sid] = (row.get("nickname"), km)
+        kills_agg: Dict[str, int] = {}
+        nickname_html: Dict[str, str] = {}
 
-        # Build rows in configured order with pretty labels
+        for page in html_pages:
+            if isinstance(page, Exception):
+                continue
+            rows = parse_rankings_html(page)
+            for row in rows:
+                sid = row.get("steamid64")
+                if not sid:
+                    continue
+                km = row.get("kills_month")
+                if km is None:
+                    continue
+                kills_agg[sid] = kills_agg.get(sid, 0) + km
+                nick = row.get("nickname")
+                if nick and sid not in nickname_html:
+                    nickname_html[sid] = nick
+
+        # Build rows, then optionally sort by kills
         table_rows: List[Tuple[str, int, int, int]] = []
         for sid in STEAM_IDS:
-            if sid in html_data:
-                nick_html, kills = html_data[sid]
-                base_label = nick_html or STEAM_ID_TO_NAME.get(sid) or sid[-6:]
-            else:
-                base_label = STEAM_ID_TO_NAME.get(sid) or sid[-6:]
-                kills = 0
+            kills = kills_agg.get(sid, 0)
+            label = nickname_html.get(sid) or STEAM_ID_TO_NAME.get(sid) or sid[-6:]
             pct_done = int(round((kills / MONTHLY_GOAL_KILLS) * 100))
             delta_vs_today = kills - today_target
-            table_rows.append((base_label, kills, pct_done, delta_vs_today))
+            table_rows.append((label, kills, pct_done, delta_vs_today))
+            # Sort primarily by kills desc, then by label to keep output stable on ties
+            table_rows.sort(key=lambda r: (-r[1], r[0].lower()))
 
         embed = discord.Embed(
             title="crescent <:crescent:855175620891508736> • warmup monthly progress",
-            description=format_table_pretty(table_rows),
+            description=format_table_pretty(table_rows, server_count=len(SERVERS), now=now),
             color=EMBED_COLOR,
         )
-        embed.set_footer(text=f"Server {SERVER} • Region {REGION} • {now.strftime('%a %b %d, %Y %H:%M %Z')}")
+        embed.set_footer(text=f"Server {SERVERS} • Region {REGION} • {now.strftime('%a %b %d, %Y %H:%M %Z')}")
         await interaction.followup.send(embed=embed)
 
 async def setup(bot: commands.Bot):
