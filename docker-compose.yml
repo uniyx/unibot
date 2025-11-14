@@ -18,7 +18,7 @@ services:
       - "6969:6969"
 
     volumes:
-      - /mnt/shared/unibot:/unibot:ro
+      - /mnt/shared/unibot:/unibot
 
     ulimits:
       nofile:
