@@ -52,17 +52,6 @@ def _ms_to_local(ms: Optional[int]) -> str:
 def _to_local_dt(ms: int) -> dt.datetime:
     return dt.datetime.fromtimestamp(ms / 1000.0, dt.timezone.utc).astimezone(ZoneInfo(OUTPUT_TZ))
 
-def _fmt_delta(seconds: float) -> str:
-    sign = "-" if seconds < 0 else ""
-    s = abs(int(seconds))
-    h, r = divmod(s, 3600)
-    m, s = divmod(r, 60)
-    if h:
-        return f"{sign}{h}h {m}m {s}s"
-    if m:
-        return f"{sign}{m}m {s}s"
-    return f"{sign}{s}s"
-
 # =========================
 # FACEIT CLIENT (Public v1 only)
 # =========================
@@ -316,15 +305,18 @@ class EseaUpcoming(commands.Cog):
             if ts < cutoff and mid not in seen_ids:
                 self._fired.pop(mid, None)
 
-    # ---------- Slash: /upcoming ----------
+    # ---------- Unified Slash: /upcoming ----------
     @guilds_decorator()
     @app_commands.command(
         name="upcoming",
-        description="Next scheduled crescent league matches (also reconciles alert scheduling)"
+        description="Show upcoming crescent league matches and whether alerts are scheduled."
     )
     async def upcoming(self, interaction: discord.Interaction):
         await interaction.response.defer(thinking=True)
+
         assert self._api is not None
+
+        # Always reconcile so alerts and upcoming state are fresh
         try:
             await self._reconcile_schedule()
             upcoming = await self._api.upcoming_created(TEAM_ID, CHAMPIONSHIP_ID)
@@ -337,69 +329,46 @@ class EseaUpcoming(commands.Cog):
             await interaction.followup.send("No upcoming matches scheduled for crescent.", ephemeral=False)
             return
 
-        bullets: List[str] = []
-        for m in upcoming:
-            opp_id = m["opponent_id"]
-            opp_name = m["opponent_name"] or "Unknown"
-            try:
-                opp_w, opp_l = await self._api.compute_record(opp_id, CHAMPIONSHIP_ID)
-            except Exception:
-                opp_w = opp_l = 0
+        lines: List[str] = []
 
-            bullets.append(
-                f"• {m['scheduled_local']} [crescent ({crescent_w}W - {crescent_l}L) vs {opp_name} ({opp_w}W - {opp_l}L)]({m['match_url']})"
-            )
+        for m in upcoming:
+            match_id   = m.get("match_id") or ""
+            opp_name   = m.get("opponent_name") or "Unknown"
+            sched_ms   = m.get("scheduled_ms")
+            match_url  = m.get("match_url") or ""
+
+            if isinstance(sched_ms, int):
+                start_unix = int(sched_ms // 1000)
+                match_rel  = f"<t:{start_unix}:R>"
+            else:
+                start_unix = None
+                match_rel  = "TBD"
+
+            # Alert is considered scheduled if there is a pending task for this match
+            task = self._scheduled.get(match_id)
+            alert_scheduled = bool(task and not task.done() and match_id not in self._fired)
+            alert_flag = "✅" if alert_scheduled else "❌"
+
+            # Format: Opponent name, time until match, alert status, link
+            if match_url:
+                lines.append(
+                    f"• **{opp_name}** • {match_rel} • alert: {alert_flag} • [room]({match_url})"
+                )
+            else:
+                lines.append(
+                    f"• **{opp_name}** • {match_rel} • alert: {alert_flag}"
+                )
 
         embed = discord.Embed(
             title=f"{TITLE_BASE} ({crescent_w}W - {crescent_l}L) • upcoming matches",
-            description="\n".join(bullets),
-            color=THEME_COLOR
-        )
-        embed.set_footer(text="Times shown in " + OUTPUT_TZ)
-        await interaction.followup.send(embed=embed)
-
-    # ---------- Slash: /alerts ----------
-    @guilds_decorator()
-    @app_commands.command(
-        name="alerts",
-        description="Debug: show which matches currently have an alert scheduled"
-    )
-    @app_commands.describe(refresh="If true, fetch FACEIT now to reconcile before listing.")
-    async def alerts(self, interaction: discord.Interaction, refresh: Optional[bool] = False):
-        await interaction.response.defer(thinking=True)
-        if refresh:
-            try:
-                await self._reconcile_schedule()
-            except Exception as e:
-                await interaction.followup.send(f"Reconcile failed: {e}", ephemeral=True)
-                return
-
-        if not self._scheduled_meta:
-            await interaction.followup.send("No alert tasks are currently scheduled.", ephemeral=True)
-            return
-
-        items: List[Tuple[int, str]] = []
-        for meta in self._scheduled_meta.values():
-            ms = meta.get("scheduled_ms")
-            if isinstance(ms, int):
-                alert_dt = _to_local_dt(ms) - dt.timedelta(minutes=ALERT_LEAD_MINUTES)
-                items.append((int(alert_dt.timestamp()), str(meta.get("opponent_name", "Unknown"))))
-
-        if not items:
-            await interaction.followup.send("No alert tasks are currently scheduled.", ephemeral=True)
-            return
-
-        items.sort(key=lambda x: x[0])
-        lines = [f"• {opp} <t:{unix}:R>" for unix, opp in items]
-
-        embed = discord.Embed(
-            title=f"{TITLE_BASE} • alert countdowns",
             description="\n".join(lines),
-            color=THEME_COLOR
+            color=THEME_COLOR,
         )
-        embed.set_footer(text=f"Lead time {ALERT_LEAD_MINUTES} min • tasks={len(items)} • Times shown via Discord relative timestamps")
+        embed.set_footer(
+            text=f"Lead time {ALERT_LEAD_MINUTES} min • Times shown via Discord relative timestamps"
+        )
 
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=False)
 
     # ---------- Background ----------
     @tasks.loop(hours=REFRESH_HOURS)
