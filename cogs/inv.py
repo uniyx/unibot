@@ -502,7 +502,7 @@ class Inv(commands.Cog):
 
         embed.add_field(
             name="Inventory value (csfloat)",
-            value=f"**{total_value:,.2f}**",
+            value=f"**${total_value:,.2f}**",
             inline=False,
         )
         embed.add_field(
