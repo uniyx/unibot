@@ -25,7 +25,7 @@ REGION = "na"
 
 # Support multiple servers
 SERVERS: List[str] = [
-    "na_na_chi_mirage19rifles",
+    "na_na_chi_mirage21rifles",
     "na_na_chi_dust2rifles",
 ]
 
