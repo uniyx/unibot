@@ -14,6 +14,7 @@ def guilds_decorator():
     return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
 
 FACEIT_BASE = "https://open.faceit.com/data/v4"
+
 KD_KEYS = ["Average K/D Ratio", "K/D Ratio", "K/D"]
 ADR_KEYS = ["Average Damage/Round", "ADR", "Average Damage per Round"]
 
@@ -110,7 +111,7 @@ class FaceitAPI:
     # ---- Recent stats via official "player stats over matches" endpoint
     async def get_recent_stats_batch(self, player_id: str, limit: int = 30) -> Dict[str, Any]:
         """
-        Uses the official endpoint that returns a player's per-match stats in one call.
+        Uses the official endpoint that returns a player's per match stats in one call.
         Aggregates K/D from summed kills and deaths and ADR as the mean of match ADRs.
         """
         url = f"{FACEIT_BASE}/players/{player_id}/games/cs2/stats"
@@ -145,6 +146,41 @@ class FaceitAPI:
 
         adr_recent = mean(adr_values) if adr_values else None
         return {"kd": kd_recent, "adr": adr_recent, "matches_count": len(items)}
+
+    # ---- Global ranking via Data API
+    async def get_global_ranking(
+        self,
+        player_id: str,
+        region: str = "NA",
+        game: str = "cs2",
+        country: Optional[str] = None,
+    ) -> Optional[int]:
+        """
+        Return the player's global ranking in the given region and game, or None.
+
+        Uses the official Data API endpoint:
+        /rankings/games/{game}/regions/{region}/players/{player_id}
+        """
+        url = f"{FACEIT_BASE}/rankings/games/{game}/regions/{region}/players/{player_id}"
+        params: Dict[str, Any] = {}
+        if country:
+            params["country"] = country
+
+        data = await self._get_json(url, params=params)
+        pos = data.get("position")
+        if isinstance(pos, int):
+            return pos
+        try:
+            return int(pos)
+        except Exception:
+            items = data.get("items") or []
+            if items and isinstance(items[0], dict):
+                item_pos = items[0].get("position")
+                try:
+                    return int(item_pos)
+                except Exception:
+                    return None
+            return None
 
 # -----------------------
 # Cog
@@ -217,6 +253,7 @@ class FaceitStats(commands.Cog):
             try:
                 pid, name, elo, url, avatar = await api.resolve_player(nick)
 
+                # Recent or lifetime stats
                 if use_recent:
                     try:
                         rec = await api.get_recent_stats_batch(pid, limit=last_matches)
@@ -240,6 +277,13 @@ class FaceitStats(commands.Cog):
                     kd = kd_raw if kd_raw is not None else "n/a"
                     adr = adr_raw if adr_raw is not None else "n/a"
 
+                # Global ranking
+                ranking: Optional[int] = None
+                try:
+                    ranking = await api.get_global_ranking(pid, region="NA", game="cs2")
+                except Exception as e:
+                    errors.append(f"{name}: failed global ranking lookup ({e})")
+
                 rows.append(
                     {
                         "name": name,
@@ -247,6 +291,7 @@ class FaceitStats(commands.Cog):
                         "elo_num": _num_or_none(elo),
                         "kd": kd,
                         "adr": adr,
+                        "ranking": ranking,
                         "url": url,
                         "avatar": avatar,
                     }
@@ -258,11 +303,12 @@ class FaceitStats(commands.Cog):
         rows.sort(key=lambda r: (r["elo_num"] is None, -(r["elo_num"] or -1)))
 
         # Build monospaced leaderboard
-        rank_w = len(str(len(rows))) if rows else 1
+        idx_w = len(str(len(rows))) if rows else 1
         name_w = max(5, max((len(r["name"]) for r in rows), default=5))
         elo_w = max(3, max((len(_fmt(r["elo"])) for r in rows), default=3))
         kd_w = max(3, max((len(_fmt(r["kd"])) for r in rows), default=3))
         adr_w = max(3, max((len(_fmt(r["adr"])) for r in rows), default=3))
+        ranking_w = max(7, max((len(_fmt(r["ranking"])) for r in rows), default=7))
 
         if use_recent:
             scope_label = f"Last {last_matches}"
@@ -270,19 +316,19 @@ class FaceitStats(commands.Cog):
             scope_label = "Lifetime"
 
         header = (
-            f"{'#':>{rank_w}}  {'Player':<{name_w}}  "
-            f"{'ELO':>{elo_w}}  {'K/D':>{kd_w}}  {'ADR':>{adr_w}}"
+            f"{'#':>{idx_w}}  {'Player':<{name_w}}  "
+            f"{'ELO':>{elo_w}}  {'K/D':>{kd_w}}  {'ADR':>{adr_w}}  {'Ranking':>{ranking_w}}"
         )
         sep = (
-            f"{'-' * rank_w}  {'-' * name_w}  "
-            f"{'-' * elo_w}  {'-' * kd_w}  {'-' * adr_w}"
+            f"{'-' * idx_w}  {'-' * name_w}  "
+            f"{'-' * elo_w}  {'-' * kd_w}  {'-' * adr_w}  {'-' * ranking_w}"
         )
 
         lines = [header, sep]
         for i, r in enumerate(rows, 1):
             lines.append(
-                f"{i:>{rank_w}}  {r['name']:<{name_w}}  "
-                f"{_fmt(r['elo']):>{elo_w}}  {_fmt(r['kd']):>{kd_w}}  {_fmt(r['adr']):>{adr_w}}"
+                f"{i:>{idx_w}}  {r['name']:<{name_w}}  "
+                f"{_fmt(r['elo']):>{elo_w}}  {_fmt(r['kd']):>{kd_w}}  {_fmt(r['adr']):>{adr_w}}  {_fmt(r['ranking']):>{ranking_w}}"
             )
 
         links = [f"[{r['name']}]({r['url']})" for r in rows if r.get("url")]
@@ -296,12 +342,18 @@ class FaceitStats(commands.Cog):
         )
         if links:
             embed.add_field(name="Profiles", value=" • ".join(links), inline=False)
+
         if errors:
+            # Clamp Notes to satisfy Discord's 1024 character limit per field
+            notes_text = "\n".join(f"• {e}" for e in errors)
+            if len(notes_text) > 1000:
+                notes_text = notes_text[:997] + "..."
             embed.add_field(
                 name="Notes",
-                value="\n".join(f"• {e}" for e in errors),
+                value=notes_text,
                 inline=False,
             )
+
         if len(rows) == 1 and rows[0].get("avatar"):
             embed.set_thumbnail(url=rows[0]["avatar"])
         embed.set_footer(text="Source: FACEIT Data API")
