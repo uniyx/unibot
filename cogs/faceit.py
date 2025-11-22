@@ -28,7 +28,8 @@ ROSTER: List[str] = [
     "xCaptain",
     "Benjitora",
     "Sham",
-    "coza-"
+    "-MJB"
+    "coza-",
 ]
 
 # -----------------------
