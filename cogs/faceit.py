@@ -20,17 +20,14 @@ ADR_KEYS = ["Average Damage/Round", "ADR", "Average Damage per Round"]
 
 THEME_COLOR = 0xFF5500
 
-# Replace with exact FACEIT nicknames
+# -----------------------
+# Roster from environment
+# -----------------------
+FACEIT_ROSTER_RAW = os.getenv("FACEIT_ROSTER", "").strip()
 ROSTER: List[str] = [
-    "uni",
-    "bud",
-    "hoax",
-    "oldfranz",
-    "xCaptain",
-    "Benjitora",
-    "Sham",
-    "-MJB",
-    "coza-",
+    nick.strip()
+    for nick in FACEIT_ROSTER_RAW.split(",")
+    if nick.strip()
 ]
 
 # -----------------------
@@ -42,12 +39,22 @@ def _num_or_none(x: Any) -> Optional[float]:
     except Exception:
         return None
 
-def _fmt(x: Any, digits: int = 2) -> str:
+def _fmt_int(x: Any) -> str:
+    """
+    Format as integer (for ELO, ranking). Returns 'n/a' if None/invalid.
+    """
     v = _num_or_none(x)
     if v is None:
-        return str(x) if x not in (None, "") else "n/a"
-    if float(v).is_integer():
-        return f"{int(v)}"
+        return "n/a"
+    return f"{int(round(v))}"
+
+def _fmt_fixed(x: Any, digits: int = 2) -> str:
+    """
+    Format as fixed-decimal float (for KD, ADR). Returns 'n/a' if None/invalid.
+    """
+    v = _num_or_none(x)
+    if v is None:
+        return "n/a"
     return f"{v:.{digits}f}"
 
 def _safe_url(u: Optional[str]) -> Optional[str]:
@@ -200,10 +207,10 @@ class FaceitStats(commands.Cog):
     @guilds_decorator()
     @app_commands.command(
         name="faceit",
-        description="FACEIT CS2 ELO, K/D, ADR for a user or the roster (default: last 30 matches)."
+        description="FACEIT CS2 ELO, K/D, ADR, and global ranking for a user or the roster (default: last 30 matches)."
     )
     @app_commands.describe(
-        user="Optional FACEIT nickname. If omitted, uses the hardcoded roster.",
+        user="Optional FACEIT nickname. If omitted, uses the FACEIT_ROSTER from the environment.",
         lifetime="If true, show lifetime stats instead of recent matches.",
         last_matches="If set, show stats over the last N matches (1 to 100). Overrides the default 30."
     )
@@ -218,6 +225,15 @@ class FaceitStats(commands.Cog):
         if not api_key:
             await interaction.response.send_message(
                 "FACEIT_API_KEY is not set on the bot host. Set it and try again.",
+                ephemeral=True,
+            )
+            return
+
+        # Require FACEIT_ROSTER if no explicit user is provided
+        if user is None and not ROSTER:
+            await interaction.response.send_message(
+                "FACEIT_ROSTER is not configured in the environment and no user was provided.\n"
+                "Set FACEIT_ROSTER in your .env (comma separated nicknames) or specify a user.",
                 ephemeral=True,
             )
             return
@@ -251,9 +267,13 @@ class FaceitStats(commands.Cog):
 
         for nick in targets:
             try:
-                pid, name, elo, url, avatar = await api.resolve_player(nick)
+                pid, name, elo_raw, url, avatar = await api.resolve_player(nick)
+                elo_num = _num_or_none(elo_raw)
 
                 # Recent or lifetime stats
+                kd_val: Optional[float]
+                adr_val: Optional[float]
+
                 if use_recent:
                     try:
                         rec = await api.get_recent_stats_batch(pid, limit=last_matches)
@@ -267,15 +287,10 @@ class FaceitStats(commands.Cog):
                             f"{name}: failed recent batch stats for last {last_matches} matches, "
                             f"fell back to lifetime ({e})"
                         )
-
-                    kd = _fmt(kd_val) if kd_val is not None else "n/a"
-                    adr = _fmt(adr_val) if adr_val is not None else "n/a"
                 else:
                     life = await api.get_lifetime_stats(pid)
-                    kd_raw = api.pick_key(life, KD_KEYS)
-                    adr_raw = api.pick_key(life, ADR_KEYS)
-                    kd = kd_raw if kd_raw is not None else "n/a"
-                    adr = adr_raw if adr_raw is not None else "n/a"
+                    kd_val = _num_or_none(api.pick_key(life, KD_KEYS))
+                    adr_val = _num_or_none(api.pick_key(life, ADR_KEYS))
 
                 # Global ranking
                 ranking: Optional[int] = None
@@ -287,10 +302,10 @@ class FaceitStats(commands.Cog):
                 rows.append(
                     {
                         "name": name,
-                        "elo": elo,
-                        "elo_num": _num_or_none(elo),
-                        "kd": kd,
-                        "adr": adr,
+                        "elo": elo_num,
+                        "elo_num": elo_num,
+                        "kd": kd_val,
+                        "adr": adr_val,
                         "ranking": ranking,
                         "url": url,
                         "avatar": avatar,
@@ -305,10 +320,10 @@ class FaceitStats(commands.Cog):
         # Build monospaced leaderboard
         idx_w = len(str(len(rows))) if rows else 1
         name_w = max(5, max((len(r["name"]) for r in rows), default=5))
-        elo_w = max(3, max((len(_fmt(r["elo"])) for r in rows), default=3))
-        kd_w = max(3, max((len(_fmt(r["kd"])) for r in rows), default=3))
-        adr_w = max(3, max((len(_fmt(r["adr"])) for r in rows), default=3))
-        ranking_w = max(7, max((len(_fmt(r["ranking"])) for r in rows), default=7))
+        elo_w = max(3, max((len(_fmt_int(r["elo"])) for r in rows), default=3))
+        kd_w = max(3, max((len(_fmt_fixed(r["kd"])) for r in rows), default=3))
+        adr_w = max(3, max((len(_fmt_fixed(r["adr"])) for r in rows), default=3))
+        ranking_w = max(7, max((len(_fmt_int(r["ranking"])) for r in rows), default=7))
 
         if use_recent:
             scope_label = f"Last {last_matches}"
@@ -328,7 +343,7 @@ class FaceitStats(commands.Cog):
         for i, r in enumerate(rows, 1):
             lines.append(
                 f"{i:>{idx_w}}  {r['name']:<{name_w}}  "
-                f"{_fmt(r['elo']):>{elo_w}}  {_fmt(r['kd']):>{kd_w}}  {_fmt(r['adr']):>{adr_w}}  {_fmt(r['ranking']):>{ranking_w}}"
+                f"{_fmt_int(r['elo']):>{elo_w}}  {_fmt_fixed(r['kd']):>{kd_w}}  {_fmt_fixed(r['adr']):>{adr_w}}  {_fmt_int(r['ranking']):>{ranking_w}}"
             )
 
         links = [f"[{r['name']}]({r['url']})" for r in rows if r.get("url")]
