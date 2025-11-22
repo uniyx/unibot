@@ -18,15 +18,15 @@ DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
 def guilds_decorator():
     return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
 
-# =========================
-# CONFIG
-# =========================
+# -----------------------
+# CONFIG from environment
+# -----------------------
 REGION = "na"
-
-# Support multiple servers
+SERVERS_RAW = os.getenv("DM_SERVERS", "").strip()
 SERVERS: List[str] = [
-    "na_na_chi_mirage19rifles",
-    "na_na_chi_dust2rifles",
+    nick.strip()
+    for nick in SERVERS_RAW.split(",")
+    if nick.strip()
 ]
 
 RANK_START = 1

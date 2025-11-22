@@ -41,7 +41,7 @@ def _num_or_none(x: Any) -> Optional[float]:
 
 def _fmt_int(x: Any) -> str:
     """
-    Format as integer (for ELO, ranking). Returns 'n/a' if None/invalid.
+    Format as integer (for ELO, rank). Returns 'n/a' if None/invalid.
     """
     v = _num_or_none(x)
     if v is None:
@@ -323,7 +323,7 @@ class FaceitStats(commands.Cog):
         elo_w = max(3, max((len(_fmt_int(r["elo"])) for r in rows), default=3))
         kd_w = max(3, max((len(_fmt_fixed(r["kd"])) for r in rows), default=3))
         adr_w = max(3, max((len(_fmt_fixed(r["adr"])) for r in rows), default=3))
-        ranking_w = max(7, max((len(_fmt_int(r["ranking"])) for r in rows), default=7))
+        ranking_w = max(4, max((len(_fmt_int(r["ranking"])) for r in rows), default=4))
 
         if use_recent:
             scope_label = f"Last {last_matches}"
@@ -332,7 +332,7 @@ class FaceitStats(commands.Cog):
 
         header = (
             f"{'#':>{idx_w}}  {'Player':<{name_w}}  "
-            f"{'ELO':>{elo_w}}  {'K/D':>{kd_w}}  {'ADR':>{adr_w}}  {'Ranking':>{ranking_w}}"
+            f"{'ELO':>{elo_w}}  {'K/D':>{kd_w}}  {'ADR':>{adr_w}}  {'Rank':>{ranking_w}}"
         )
         sep = (
             f"{'-' * idx_w}  {'-' * name_w}  "
