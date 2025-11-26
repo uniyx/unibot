@@ -320,6 +320,11 @@ class EseaUpcoming(commands.Cog):
         try:
             await self._reconcile_schedule()
             upcoming = await self._api.upcoming_created(TEAM_ID, CHAMPIONSHIP_ID)
+
+            # Ensure visible matches are scheduled, idempotent
+            for m in upcoming:
+                self._schedule_alert_if_needed(m)
+
             crescent_w, crescent_l = await self._api.compute_record(TEAM_ID, CHAMPIONSHIP_ID)
         except Exception as e:
             await interaction.followup.send(f"Error fetching data: {e}", ephemeral=True)
@@ -344,9 +349,17 @@ class EseaUpcoming(commands.Cog):
                 start_unix = None
                 match_rel  = "TBD"
 
-            # Alert is considered scheduled if there is a pending task for this match
-            task = self._scheduled.get(match_id)
-            alert_scheduled = bool(task and not task.done() and match_id not in self._fired)
+            # Alert flag no longer depends on transient Task state
+            if isinstance(sched_ms, int):
+                seconds_until_alert = self._alert_time_seconds(sched_ms)
+                alert_scheduled = (
+                    match_id not in self._fired and
+                    seconds_until_alert > -ALERT_GRACE_SECONDS
+                )
+            else:
+                # If the match has no timestamp yet, assume it as not scheduled
+                alert_scheduled = False
+
             alert_flag = "✅" if alert_scheduled else "❌"
 
             # Format: Opponent name, time until match, alert status, link
