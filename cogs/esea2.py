@@ -62,10 +62,6 @@ def _to_float(x: Any) -> float:
     except Exception:
         return 0.0
 
-def _fmt_float(x: float, places: int) -> str:
-    s = f"{x:.{places}f}".rstrip("0").rstrip(".")
-    return s if s else "0"
-
 def _v1_headers() -> Dict[str, str]:
     return {"Accept": "application/json"}
 
@@ -265,12 +261,21 @@ def _aggregate_totals(per_match: List[Dict[str, Any]]) -> Dict[str, Dict[str, An
 def _render_table(agg: Dict[str, Dict[str, Any]]) -> str:
     rows: List[Dict[str, Any]] = list(agg.values())[:20]  # safety cap for embed size
 
+    # Pre-format numeric fields with fixed decimals so we can size columns correctly
+    formatted_rows = []
+    for r in rows:
+        kd_str  = f"{r['kd_overall']:.3f}"
+        adr_str = f"{r['adr_overall']:.2f}"
+        hs_str  = f"{r['hs_pct_overall']:.2f}"
+        kpr_str = f"{r['kpr_overall']:.3f}"
+        formatted_rows.append((r, kd_str, adr_str, hs_str, kpr_str))
+
     name_w = max(5, max((len(r["nickname"]) for r in rows), default=5))
     mp_w   = max(2, len("MP"))
-    kd_w   = max(4, len("KD"))
-    adr_w  = max(5, len("ADR"))
-    hs_w   = max(4, len("HS%"))
-    kpr_w  = max(3, len("KPR"))
+    kd_w   = max(4, len("KD"), *(len(fr[1]) for fr in formatted_rows) or [4])
+    adr_w  = max(5, len("ADR"), *(len(fr[2]) for fr in formatted_rows) or [5])
+    hs_w   = max(4, len("HS%"), *(len(fr[3]) for fr in formatted_rows) or [4])
+    kpr_w  = max(3, len("KPR"), *(len(fr[4]) for fr in formatted_rows) or [3])
     rnd_w  = max(4, len("Rnds"))
 
     header = (
@@ -293,14 +298,14 @@ def _render_table(agg: Dict[str, Dict[str, Any]]) -> str:
     )
 
     lines = [header, sep]
-    for r in rows:
+    for r, kd_str, adr_str, hs_str, kpr_str in formatted_rows:
         lines.append(
             f"{r['nickname']:<{name_w}}  "
             f"{r['matches_played']:>{mp_w}}  "
-            f"{_fmt_float(r['kd_overall'], 3):>{kd_w}}  "
-            f"{_fmt_float(r['adr_overall'], 2):>{adr_w}}  "
-            f"{_fmt_float(r['hs_pct_overall'], 2):>{hs_w}}  "
-            f"{_fmt_float(r['kpr_overall'], 3):>{kpr_w}}  "
+            f"{kd_str:>{kd_w}}  "
+            f"{adr_str:>{adr_w}}  "
+            f"{hs_str:>{hs_w}}  "
+            f"{kpr_str:>{kpr_w}}  "
             f"{r['rounds']:>{rnd_w}}"
         )
 

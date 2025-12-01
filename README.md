@@ -42,13 +42,13 @@ cd unibot
 ```
 
 ### 2. Configure environment
-Create a `.env` file:
+Create a `.env` file.:
 
 ```
 DISCORD_TOKEN=your_token
 FACEIT_API_KEY=...
-ESEA_API_KEY=...
-DEV_GUILD_ID=optional_id
+DEV_GUILD_ID=...
+INSTANCE_TAG=...
 ```
 
 ### 3. Build and run with Docker

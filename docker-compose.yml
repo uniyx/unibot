@@ -1,6 +1,7 @@
 services:
   unibot:
     container_name: unibot
+    user: "0:0" # root
     build:
       context: .
       dockerfile: Dockerfile
