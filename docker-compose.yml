@@ -1,11 +1,14 @@
 services:
   unibot:
     container_name: unibot
-    user: "0:0" # root
+    user: "0:0"  # root
     build:
       context: .
       dockerfile: Dockerfile
     restart: unless-stopped
+
+    dns:
+      - 10.136.201.114
 
     env_file:
       - .env
