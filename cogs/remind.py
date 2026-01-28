@@ -363,7 +363,7 @@ class Remind(commands.Cog):
             )
 
         embed.description = "\n\n".join(lines)
-        embed.set_footer(text=f"Requested by <@{requested_by}> • cancel buttons only work for the creator • showing up to {min(limit, 25)}")
+        embed.set_footer(text=f"Requested by <@{int(requested_by)}> • cancel buttons only work for the creator • showing up to {min(limit, 25)}")
         return embed
 
     async def _send_team_embed(
