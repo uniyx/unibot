@@ -45,6 +45,7 @@ EMBED_COLOR = 0x0C9547
 # Hardcoded players with fallback names, profile URL -> nickname
 PROFILE_URLS: Dict[str, str] = {
     "https://steamcommunity.com/profiles/76561198989623289": "uni",
+    "https://steamcommunity.com/profiles/76561198085229443": "Benji",
     "https://steamcommunity.com/profiles/76561198209992732": "xCaptain",
     "https://steamcommunity.com/profiles/76561198855633260": "hoax",
     "https://steamcommunity.com/profiles/76561198097413054": "bud",
