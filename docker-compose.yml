@@ -23,6 +23,7 @@ services:
 
     volumes:
       - /mnt/shared/unibot:/unibot
+      - /srv/unibot_state:/state
 
     ulimits:
       nofile:
