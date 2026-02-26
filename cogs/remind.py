@@ -318,8 +318,6 @@ class Remind(commands.Cog):
     async def _guard(self, interaction: discord.Interaction) -> None:
         if interaction.guild is None:
             raise RemindError("This command must be used in a server.")
-        if TEAM_GUILD_ID and interaction.guild.id != TEAM_GUILD_ID:
-            raise RemindError("This command can only be used in the team server.")
         if not member_has_role(interaction.user, TEAM_ROLE_ID):
             raise RemindError("You do not have permission to use this command.")
 
@@ -648,14 +646,10 @@ class Remind(commands.Cog):
         if not self.bot.is_ready():
             return
 
-        # Prefer the configured team guild if provided
-        guild_id = TEAM_GUILD_ID
-        if not guild_id:
-            # fallback: if only in one guild, use it
-            if len(self.bot.guilds) == 1:
-                guild_id = self.bot.guilds[0].id
-            else:
-                return  # ambiguous; user should set TEAM_GUILD_ID
+        if len(self.bot.guilds) == 1:
+            guild_id = self.bot.guilds[0].id
+        else:
+            return
 
         lim = max(1, min(25, int(REMIND_DAILY_LIMIT)))
 
