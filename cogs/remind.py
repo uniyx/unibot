@@ -582,8 +582,10 @@ class Remind(commands.Cog):
 
         except RemindError as e:
             await interaction.followup.send(str(e), ephemeral=True)
-        except Exception:
-            await interaction.followup.send("Unexpected error while scheduling reminder. Check bot logs.", ephemeral=True)
+        except Exception as e:
+            # safe, concise error surfaced to you; still ephemeral
+            await interaction.followup.send(f"Unexpected error: {type(e).__name__}: {e}", ephemeral=True)
+            raise
 
     @guilds_decorator()
     @app_commands.command(
