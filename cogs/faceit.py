@@ -3,6 +3,7 @@ import os
 import asyncio
 from statistics import mean
 from typing import Dict, List, Optional, Tuple, Any
+from collections import defaultdict
 
 import aiohttp
 import discord
@@ -24,11 +25,7 @@ THEME_COLOR = 0xFF5500
 # Roster from environment
 # -----------------------
 FACEIT_ROSTER_RAW = os.getenv("FACEIT_ROSTER", "").strip()
-ROSTER: List[str] = [
-    nick.strip()
-    for nick in FACEIT_ROSTER_RAW.split(",")
-    if nick.strip()
-]
+ROSTER: List[str] = [nick.strip() for nick in FACEIT_ROSTER_RAW.split(",") if nick.strip()]
 
 # -----------------------
 # Helpers
@@ -40,18 +37,12 @@ def _num_or_none(x: Any) -> Optional[float]:
         return None
 
 def _fmt_int(x: Any) -> str:
-    """
-    Format as integer (for ELO, rank). Returns 'n/a' if None/invalid.
-    """
     v = _num_or_none(x)
     if v is None:
         return "n/a"
     return f"{int(round(v))}"
 
 def _fmt_fixed(x: Any, digits: int = 2) -> str:
-    """
-    Format as fixed-decimal float (for KD, ADR). Returns 'n/a' if None/invalid.
-    """
     v = _num_or_none(x)
     if v is None:
         return "n/a"
@@ -63,46 +54,113 @@ def _safe_url(u: Optional[str]) -> Optional[str]:
     return u.replace("{lang}", "en").rstrip("/")
 
 # -----------------------
+# API call accounting
+# -----------------------
+class ApiCounter:
+    """
+    Counts attempted HTTP calls, including retries.
+    Tracks totals by label (endpoint class).
+    """
+    def __init__(self) -> None:
+        self.total = 0
+        self.by_label: Dict[str, int] = defaultdict(int)
+
+    def inc(self, label: str) -> None:
+        self.total += 1
+        self.by_label[label] += 1
+
+    def summary_lines(self) -> List[str]:
+        items = sorted(self.by_label.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [f"{k}: {v}" for k, v in items]
+
+# -----------------------
 # FACEIT API
 # -----------------------
 class FaceitAPI:
-    def __init__(self, session: aiohttp.ClientSession, api_key: str):
+    def __init__(self, session: aiohttp.ClientSession, api_key: str, *, concurrency: int = 5):
         self.session = session
         self.headers = {"Authorization": f"Bearer {api_key}"}
 
-    async def _get_json(self, url: str, params: Optional[dict] = None, *, retries: int = 3) -> dict:
+        self.counter = ApiCounter()
+        self.sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+        # Per-command in-memory caches
+        self._cache_resolve: Dict[str, Tuple[str, str, Optional[int], Optional[str], Optional[str]]] = {}
+        self._cache_lifetime: Dict[str, Dict[str, str]] = {}
+        self._cache_recent_batch: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self._cache_ranking: Dict[Tuple[str, str, str, Optional[str]], Optional[int]] = {}
+
+    async def _get_json(
+        self,
+        url: str,
+        params: Optional[dict] = None,
+        *,
+        retries: int = 3,
+        label: str = "unknown",
+    ) -> dict:
         backoff = 0.75
+
         for attempt in range(retries):
-            async with self.session.get(url, headers=self.headers, params=params, timeout=30) as r:
-                if r.status == 429 and attempt < retries - 1:
-                    await asyncio.sleep(backoff)
-                    backoff *= 2
-                    continue
-                if r.status >= 400:
-                    text = await r.text()
-                    raise RuntimeError(f"FACEIT GET {url} failed [{r.status}]: {text[:200]}")
-                return await r.json()
+            async with self.sem:
+                self.counter.inc(label)
+                async with self.session.get(url, headers=self.headers, params=params, timeout=30) as r:
+                    if r.status == 429 and attempt < retries - 1:
+                        retry_after = r.headers.get("Retry-After")
+                        if retry_after:
+                            try:
+                                wait = float(retry_after)
+                            except Exception:
+                                wait = backoff
+                        else:
+                            wait = backoff
+
+                        await asyncio.sleep(wait)
+                        backoff *= 2
+                        continue
+
+                    if r.status >= 400:
+                        text = await r.text()
+                        raise RuntimeError(f"FACEIT GET {url} failed [{r.status}]: {text[:200]}")
+
+                    return await r.json()
+
         raise RuntimeError("Exhausted retries to FACEIT API")
 
-    # ---- Players and lifetime stats
     async def resolve_player(self, nickname: str) -> Tuple[str, str, Optional[int], Optional[str], Optional[str]]:
-        """
-        Return (player_id, canonical_nickname, elo, faceit_url, avatar_url).
-        """
-        data = await self._get_json(f"{FACEIT_BASE}/players", params={"nickname": nickname})
+        if nickname in self._cache_resolve:
+            return self._cache_resolve[nickname]
+
+        data = await self._get_json(
+            f"{FACEIT_BASE}/players",
+            params={"nickname": nickname},
+            label="players.resolve",
+        )
+
         pid = data.get("player_id")
         if not pid:
             raise RuntimeError(f"Could not resolve player_id for '{nickname}'")
+
         nick = data.get("nickname", nickname)
         games = data.get("games") or {}
         cs2 = games.get("cs2") or games.get("csgo")
         elo = cs2.get("faceit_elo") if isinstance(cs2, dict) else None
-        return pid, nick, elo, _safe_url(data.get("faceit_url")), data.get("avatar")
+
+        out = (pid, nick, elo, _safe_url(data.get("faceit_url")), data.get("avatar"))
+        self._cache_resolve[nickname] = out
+        return out
 
     async def get_lifetime_stats(self, player_id: str) -> Dict[str, str]:
-        data = await self._get_json(f"{FACEIT_BASE}/players/{player_id}/stats/cs2")
+        if player_id in self._cache_lifetime:
+            return self._cache_lifetime[player_id]
+
+        data = await self._get_json(
+            f"{FACEIT_BASE}/players/{player_id}/stats/cs2",
+            label="players.stats.lifetime",
+        )
         lifetime = data.get("lifetime") or {}
-        return {k.strip(): v for k, v in lifetime.items()} if isinstance(lifetime, dict) else {}
+        out = {k.strip(): v for k, v in lifetime.items()} if isinstance(lifetime, dict) else {}
+        self._cache_lifetime[player_id] = out
+        return out
 
     @staticmethod
     def pick_key(d: Dict[str, str], candidates: List[str]) -> Optional[str]:
@@ -115,16 +173,16 @@ class FaceitAPI:
                 return str(d[lower[k.lower()]])
         return None
 
-    # ---- Recent stats via official "player stats over matches" endpoint
     async def get_recent_stats_batch(self, player_id: str, limit: int = 30) -> Dict[str, Any]:
-        """
-        Uses the official endpoint that returns a player's per match stats in one call.
-        Aggregates K/D from summed kills and deaths and ADR as the mean of match ADRs.
-        """
-        url = f"{FACEIT_BASE}/players/{player_id}/games/cs2/stats"
-        params = {"offset": 0, "limit": max(1, min(100, int(limit)))}
+        limit = max(1, min(100, int(limit)))
+        cache_key = (player_id, limit)
+        if cache_key in self._cache_recent_batch:
+            return self._cache_recent_batch[cache_key]
 
-        data = await self._get_json(url, params=params)
+        url = f"{FACEIT_BASE}/players/{player_id}/games/cs2/stats"
+        params = {"offset": 0, "limit": limit}
+
+        data = await self._get_json(url, params=params, label="players.stats.recent_batch")
         items = data.get("items") or []
 
         kills_total = 0
@@ -152,9 +210,10 @@ class FaceitAPI:
             kd_recent = float(kills_total) / float(deaths_total)
 
         adr_recent = mean(adr_values) if adr_values else None
-        return {"kd": kd_recent, "adr": adr_recent, "matches_count": len(items)}
+        out = {"kd": kd_recent, "adr": adr_recent, "matches_count": len(items)}
+        self._cache_recent_batch[cache_key] = out
+        return out
 
-    # ---- Global ranking via Data API
     async def get_global_ranking(
         self,
         player_id: str,
@@ -162,32 +221,37 @@ class FaceitAPI:
         game: str = "cs2",
         country: Optional[str] = None,
     ) -> Optional[int]:
-        """
-        Return the player's global ranking in the given region and game, or None.
+        cache_key = (player_id, region, game, country)
+        if cache_key in self._cache_ranking:
+            return self._cache_ranking[cache_key]
 
-        Uses the official Data API endpoint:
-        /rankings/games/{game}/regions/{region}/players/{player_id}
-        """
         url = f"{FACEIT_BASE}/rankings/games/{game}/regions/{region}/players/{player_id}"
         params: Dict[str, Any] = {}
         if country:
             params["country"] = country
 
-        data = await self._get_json(url, params=params)
+        data = await self._get_json(url, params=params, label="rankings.global")
         pos = data.get("position")
+
+        out: Optional[int]
         if isinstance(pos, int):
-            return pos
-        try:
-            return int(pos)
-        except Exception:
-            items = data.get("items") or []
-            if items and isinstance(items[0], dict):
-                item_pos = items[0].get("position")
-                try:
-                    return int(item_pos)
-                except Exception:
-                    return None
-            return None
+            out = pos
+        else:
+            try:
+                out = int(pos)
+            except Exception:
+                items = data.get("items") or []
+                if items and isinstance(items[0], dict):
+                    item_pos = items[0].get("position")
+                    try:
+                        out = int(item_pos)
+                    except Exception:
+                        out = None
+                else:
+                    out = None
+
+        self._cache_ranking[cache_key] = out
+        return out
 
 # -----------------------
 # Cog
@@ -212,7 +276,8 @@ class FaceitStats(commands.Cog):
     @app_commands.describe(
         user="Optional FACEIT nickname. If omitted, uses the FACEIT_ROSTER from the environment.",
         lifetime="If true, show lifetime stats instead of recent matches.",
-        last_matches="If set, show stats over the last N matches (1 to 100). Overrides the default 30."
+        last_matches="If set, show stats over the last N matches (1 to 100). Overrides the default 30.",
+        call="If true, append API call breakdown (includes retries)."
     )
     async def faceit(
         self,
@@ -220,6 +285,7 @@ class FaceitStats(commands.Cog):
         user: Optional[str] = None,
         lifetime: Optional[bool] = False,
         last_matches: Optional[int] = None,
+        call: Optional[bool] = False,
     ):
         api_key = os.getenv("FACEIT_API_KEY", "").strip()
         if not api_key:
@@ -229,7 +295,6 @@ class FaceitStats(commands.Cog):
             )
             return
 
-        # Require FACEIT_ROSTER if no explicit user is provided
         if user is None and not ROSTER:
             await interaction.response.send_message(
                 "FACEIT_ROSTER is not configured in the environment and no user was provided.\n"
@@ -239,14 +304,10 @@ class FaceitStats(commands.Cog):
             return
 
         assert self.session is not None
-        api = FaceitAPI(self.session, api_key)
+        api = FaceitAPI(self.session, api_key, concurrency=5)
 
         await interaction.response.defer(thinking=True)
 
-        # Decide scope:
-        # 1. If last_matches is provided, use that.
-        # 2. Else if lifetime is true, use lifetime.
-        # 3. Else default to last 30 matches.
         if last_matches is not None:
             use_recent = True
             try:
@@ -262,21 +323,16 @@ class FaceitStats(commands.Cog):
             last_matches = 30
 
         targets = [user] if user else ROSTER
-        rows = []
         errors: List[str] = []
 
-        for nick in targets:
+        async def fetch_one(nick: str) -> Optional[Dict[str, Any]]:
             try:
                 pid, name, elo_raw, url, avatar = await api.resolve_player(nick)
                 elo_num = _num_or_none(elo_raw)
 
-                # Recent or lifetime stats
-                kd_val: Optional[float]
-                adr_val: Optional[float]
-
                 if use_recent:
                     try:
-                        rec = await api.get_recent_stats_batch(pid, limit=last_matches)
+                        rec = await api.get_recent_stats_batch(pid, limit=last_matches or 30)
                         kd_val = rec["kd"]
                         adr_val = rec["adr"]
                     except Exception as e:
@@ -284,40 +340,38 @@ class FaceitStats(commands.Cog):
                         kd_val = _num_or_none(api.pick_key(life, KD_KEYS))
                         adr_val = _num_or_none(api.pick_key(life, ADR_KEYS))
                         errors.append(
-                            f"{name}: failed recent batch stats for last {last_matches} matches, "
-                            f"fell back to lifetime ({e})"
+                            f"{name}: failed recent batch stats for last {last_matches} matches, fell back to lifetime ({e})"
                         )
                 else:
                     life = await api.get_lifetime_stats(pid)
                     kd_val = _num_or_none(api.pick_key(life, KD_KEYS))
                     adr_val = _num_or_none(api.pick_key(life, ADR_KEYS))
 
-                # Global ranking
                 ranking: Optional[int] = None
                 try:
                     ranking = await api.get_global_ranking(pid, region="NA", game="cs2")
                 except Exception as e:
                     errors.append(f"{name}: failed global ranking lookup ({e})")
 
-                rows.append(
-                    {
-                        "name": name,
-                        "elo": elo_num,
-                        "elo_num": elo_num,
-                        "kd": kd_val,
-                        "adr": adr_val,
-                        "ranking": ranking,
-                        "url": url,
-                        "avatar": avatar,
-                    }
-                )
+                return {
+                    "name": name,
+                    "elo": elo_num,
+                    "elo_num": elo_num,
+                    "kd": kd_val,
+                    "adr": adr_val,
+                    "ranking": ranking,
+                    "url": url,
+                    "avatar": avatar,
+                }
             except Exception as e:
                 errors.append(f"{nick}: {e}")
+                return None
 
-        # Sort by ELO descending; None goes last
+        results = await asyncio.gather(*(fetch_one(n) for n in targets))
+        rows = [r for r in results if r is not None]
+
         rows.sort(key=lambda r: (r["elo_num"] is None, -(r["elo_num"] or -1)))
 
-        # Build monospaced leaderboard
         idx_w = len(str(len(rows))) if rows else 1
         name_w = max(5, max((len(r["name"]) for r in rows), default=5))
         elo_w = max(3, max((len(_fmt_int(r["elo"])) for r in rows), default=3))
@@ -325,10 +379,7 @@ class FaceitStats(commands.Cog):
         adr_w = max(3, max((len(_fmt_fixed(r["adr"])) for r in rows), default=3))
         ranking_w = max(4, max((len(_fmt_int(r["ranking"])) for r in rows), default=4))
 
-        if use_recent:
-            scope_label = f"Last {last_matches}"
-        else:
-            scope_label = "Lifetime"
+        scope_label = f"Last {last_matches}" if use_recent else "Lifetime"
 
         header = (
             f"{'#':>{idx_w}}  {'Player':<{name_w}}  "
@@ -343,38 +394,45 @@ class FaceitStats(commands.Cog):
         for i, r in enumerate(rows, 1):
             lines.append(
                 f"{i:>{idx_w}}  {r['name']:<{name_w}}  "
-                f"{_fmt_int(r['elo']):>{elo_w}}  {_fmt_fixed(r['kd']):>{kd_w}}  {_fmt_fixed(r['adr']):>{adr_w}}  {_fmt_int(r['ranking']):>{ranking_w}}"
+                f"{_fmt_int(r['elo']):>{elo_w}}  {_fmt_fixed(r['kd']):>{kd_w}}  "
+                f"{_fmt_fixed(r['adr']):>{adr_w}}  {_fmt_int(r['ranking']):>{ranking_w}}"
             )
 
         links = [f"[{r['name']}]({r['url']})" for r in rows if r.get("url")]
 
-        title = f"FACEIT CS2 Leaderboard • {scope_label}"
-
         embed = discord.Embed(
-            title=title,
+            title=f"FACEIT CS2 Leaderboard • {scope_label}",
             description="```text\n" + "\n".join(lines) + "\n```",
             color=THEME_COLOR,
         )
+
         if links:
             embed.add_field(name="Profiles", value=" • ".join(links), inline=False)
 
         if errors:
-            # Clamp Notes to satisfy Discord's 1024 character limit per field
             notes_text = "\n".join(f"• {e}" for e in errors)
             if len(notes_text) > 1000:
                 notes_text = notes_text[:997] + "..."
+            embed.add_field(name="Notes", value=notes_text, inline=False)
+
+        # Only include call breakdown when explicitly requested
+        if bool(call):
+            call_lines = api.counter.summary_lines()
+            call_text = "\n".join(call_lines)
+            if len(call_text) > 1000:
+                call_text = call_text[:997] + "..."
             embed.add_field(
-                name="Notes",
-                value=notes_text,
+                name="API Calls",
+                value=f"Total: {api.counter.total}\n{call_text}",
                 inline=False,
             )
 
         if len(rows) == 1 and rows[0].get("avatar"):
             embed.set_thumbnail(url=rows[0]["avatar"])
+
         embed.set_footer(text="Source: FACEIT Data API")
 
         await interaction.followup.send(embed=embed)
-
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(FaceitStats(bot))
