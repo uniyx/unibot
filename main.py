@@ -74,6 +74,7 @@ class UniBot(commands.Bot):
             "cogs.tweets",
             "cogs.portfolio",
             "cogs.faceit",
+            "cogs.fcr",
             "cogs.esea",
             "cogs.esea2",
             "cogs.dm",
