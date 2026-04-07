@@ -1,10 +1,9 @@
 # cogs/esea.py
 import os
-import re
 import asyncio
 import sqlite3
 import datetime as dt
-from typing import Any, Dict, List, Optional, Tuple, Set
+from typing import Any, Dict, List, Optional, Tuple
 
 import aiohttp
 import discord
@@ -18,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 OUTPUT_TZ       = "America/New_York"
 TEAM_ID         = "15c9a36f-8169-49eb-a41b-0a0e7567ed37"      # crescent
-CHAMPIONSHIP_ID = "f5856452-1bea-458d-acf2-69ab4d512f75"      # ESEA S56 NA Main Central
+CHAMPIONSHIP_ID = "840b4960-f24c-4d79-8fad-3fe551683034"      # S57 NA Main Central - Regular Season
 
 FACEIT_PUBLIC_V1  = "https://www.faceit.com/api"
 FACEIT_ROOM_BASE  = "https://www.faceit.com/en/cs2/room"
@@ -65,9 +64,6 @@ def _ms_to_local(ms: Optional[int]) -> str:
     dtu = dt.datetime.fromtimestamp(int(ms) / 1000.0, dt.timezone.utc)
     return dtu.astimezone(ZoneInfo(OUTPUT_TZ)).strftime("%a %b %d, %Y %H:%M %Z")
 
-def _to_local_dt(ms: int) -> dt.datetime:
-    return dt.datetime.fromtimestamp(ms / 1000.0, dt.timezone.utc).astimezone(ZoneInfo(OUTPUT_TZ))
-
 def _alert_at_unix(sched_ms: int) -> int:
     # alert time is schedule minus lead minutes
     start_unix = int(sched_ms // 1000)
@@ -76,12 +72,39 @@ def _alert_at_unix(sched_ms: int) -> int:
 def _seconds_until(unix_ts: int) -> float:
     return float(unix_ts - _now_unix())
 
+def _to_timestamp_ms(value: Any) -> Optional[int]:
+    if value is None or value == "":
+        return None
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value if value >= 10**12 else value * 1000
+    if isinstance(value, float):
+        numeric = int(value)
+        return numeric if numeric >= 10**12 else numeric * 1000
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    try:
+        numeric = int(raw)
+    except ValueError:
+        numeric = None
+    if numeric is not None:
+        return numeric if numeric >= 10**12 else numeric * 1000
+
+    try:
+        parsed = dt.datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return int(parsed.timestamp() * 1000)
+
 # =========================
 # SQLITE HELPERS
 # =========================
-
-class EseaDbError(RuntimeError):
-    pass
 
 def _ensure_db_dir(path: str) -> None:
     d = os.path.dirname(path)
@@ -155,8 +178,16 @@ def _mark_fired(conn: sqlite3.Connection, match_id: str, fired_unix: int) -> Non
         (fired_unix, match_id),
     )
 
-def _delete_match(conn: sqlite3.Connection, match_id: str) -> None:
-    conn.execute("DELETE FROM esea_alerts WHERE match_id = ?", (match_id,))
+def _row_to_dict(row: Tuple[Any, Any, Any, Any, Any, Any]) -> Dict[str, Any]:
+    mid, sched_ms, alert_at, opp, url, fired = row
+    return {
+        "match_id": mid,
+        "scheduled_ms": sched_ms,
+        "alert_at_unix": alert_at,
+        "opponent_name": opp or "Unknown",
+        "match_url": url or "",
+        "fired_unix": fired,
+    }
 
 def _get_pending_rows(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
     rows = conn.execute(
@@ -168,17 +199,7 @@ def _get_pending_rows(conn: sqlite3.Connection) -> List[Dict[str, Any]]:
         """
     ).fetchall()
 
-    out: List[Dict[str, Any]] = []
-    for (mid, sched_ms, alert_at, opp, url, fired) in rows:
-        out.append({
-            "match_id": mid,
-            "scheduled_ms": sched_ms,
-            "alert_at_unix": alert_at,
-            "opponent_name": opp or "Unknown",
-            "match_url": url or "",
-            "fired_unix": fired,
-        })
-    return out
+    return [_row_to_dict(row) for row in rows]
 
 def _get_upcoming_rows(conn: sqlite3.Connection, limit: int = 10) -> List[Dict[str, Any]]:
     now = _now_unix()
@@ -194,17 +215,30 @@ def _get_upcoming_rows(conn: sqlite3.Connection, limit: int = 10) -> List[Dict[s
         (now, int(limit)),
     ).fetchall()
 
-    out: List[Dict[str, Any]] = []
-    for (mid, sched_ms, alert_at, opp, url, fired) in rows:
-        out.append({
-            "match_id": mid,
-            "scheduled_ms": sched_ms,
-            "alert_at_unix": alert_at,
-            "opponent_name": opp or "Unknown",
-            "match_url": url or "",
-            "fired_unix": fired,
-        })
-    return out
+    return [_row_to_dict(row) for row in rows]
+
+def _alert_flag(row: Dict[str, Any], now: int) -> str:
+    fired = row.get("fired_unix")
+    alert_at = row.get("alert_at_unix")
+    if fired is not None:
+        return "✅"
+    if alert_at is None:
+        return "❌"
+    return "✅" if (alert_at - now) >= -ALERT_GRACE_SECONDS else "❌"
+
+def _match_relative_time(scheduled_ms: Optional[int]) -> str:
+    if isinstance(scheduled_ms, int):
+        return f"<t:{int(scheduled_ms // 1000)}:R>"
+    return "TBD"
+
+def _upcoming_line(row: Dict[str, Any], now: int) -> str:
+    opp = row.get("opponent_name") or "Unknown"
+    url = row.get("match_url") or ""
+    match_rel = _match_relative_time(row.get("scheduled_ms"))
+    alert = _alert_flag(row, now)
+    if url:
+        return f"• **{opp}** • {match_rel} • alert: {alert} • [room]({url})"
+    return f"• **{opp}** • {match_rel} • alert: {alert}"
 
 def _gc_stale(conn: sqlite3.Connection) -> None:
     cutoff = _now_unix() - int(STALE_SEEN_HOURS * 3600)
@@ -230,33 +264,58 @@ class FaceitV1Client:
     def _headers(self) -> Dict[str, str]:
         return {"Accept": "application/json"}
 
-    async def fetch_team_fixtures(self, team_id: str, champ_id: str) -> List[Dict[str, Any]]:
+    async def _fetch_paged_items(
+        self,
+        url: str,
+        *,
+        params: Dict[str, str],
+        limit: int,
+        payload_path: str = "payload.items",
+    ) -> List[Dict[str, Any]]:
         items: List[Dict[str, Any]] = []
         offset = 0
-        limit = 70
+
         while True:
-            params = {
-                "participantId": team_id,
-                "participantType": "TEAM",
-                "championshipId": champ_id,
-                "limit": str(limit),
-                "offset": str(offset),
-                "sort": "ASC",
-            }
-            url = f"{FACEIT_PUBLIC_V1}/championships/v1/matches"
-            async with self.session.get(url, params=params, headers=self._headers(), timeout=REQUEST_TIMEOUT) as resp:
-                if resp.status in (404, 400):
+            page_params = dict(params)
+            page_params["offset"] = str(offset)
+            page_params["limit"] = str(limit)
+
+            async with self.session.get(url, params=page_params, headers=self._headers(), timeout=REQUEST_TIMEOUT) as resp:
+                if resp.status in (400, 404):
                     break
                 if resp.status != 200:
                     break
                 data = await resp.json()
-                page = (data.get("payload") or {}).get("items") or []
-                if not page:
+
+            page: Any = data
+            for key in payload_path.split("."):
+                if not isinstance(page, dict):
+                    page = []
                     break
-                items.extend(page)
-                if len(page) < limit:
-                    break
-                offset += limit
+                page = page.get(key)
+
+            if not isinstance(page, list) or not page:
+                break
+
+            items.extend(x for x in page if isinstance(x, dict))
+            if len(page) < limit:
+                break
+            offset += limit
+
+        return items
+
+    async def fetch_team_fixtures(self, team_id: str, champ_id: str) -> List[Dict[str, Any]]:
+        items = await self._fetch_paged_items(
+            f"{FACEIT_PUBLIC_V1}/championships/v1/matches",
+            params={
+                "participantId": team_id,
+                "participantType": "TEAM",
+                "championshipId": champ_id,
+                "sort": "ASC",
+            },
+            limit=70,
+            payload_path="payload.items",
+        )
         items.sort(key=lambda m: (m.get("origin", {}).get("schedule", 0)))
         return items
 
@@ -298,35 +357,55 @@ class FaceitV1Client:
                 losses += 1
         return wins, losses
 
-    async def upcoming_created(self, team_id: str, champ_id: str) -> List[Dict[str, Any]]:
-        fixtures = await self.fetch_team_fixtures(team_id, champ_id)
-        upcoming = [m for m in fixtures if str(m.get("status", "")).lower() == "created"]
+    async def upcoming_scheduled(self, team_id: str, champ_id: str) -> List[Dict[str, Any]]:
+        items = await self._fetch_paged_items(
+            f"{FACEIT_PUBLIC_V1}/team-leagues/v2/matches",
+            params={
+                "championship_ids": champ_id,
+                "entityId": team_id,
+                "entityType": "PREMADE_TEAM",
+                "status": "MATCH_STATUS_SCHEDULED",
+            },
+            limit=40,
+            payload_path="payload",
+        )
 
         out: List[Dict[str, Any]] = []
-        for m in upcoming:
+        for m in items:
             factions = m.get("factions") or []
-            if len(factions) != 2:
+            if not isinstance(factions, list) or len(factions) != 2:
                 continue
-            a_id = str(factions[0].get("id"))
-            b_id = str(factions[1].get("id"))
-            opp_id = a_id if a_id != team_id else b_id
 
-            origin = m.get("origin") or {}
-            room_id = str(origin.get("id") or "")
-            sched_ms = origin.get("schedule")
+            opp_faction: Optional[Dict[str, Any]] = None
+            for faction in factions:
+                faction_team_id = str(faction.get("premade_team_id") or "")
+                if faction_team_id == team_id:
+                    continue
+                opp_faction = faction
+                break
+            if not opp_faction:
+                continue
 
-            try:
-                opp_name = await self.team_name(opp_id)
-            except Exception:
-                opp_name = opp_id
+            opp_id = str(opp_faction.get("premade_team_id") or "")
+            sched_ms = _to_timestamp_ms(m.get("scheduled_time"))
+            match_id = str(m.get("id") or "")
+
+            opp_name = str(opp_faction.get("name") or "").strip()
+            if not opp_name and opp_id:
+                try:
+                    opp_name = await self.team_name(opp_id)
+                except Exception:
+                    opp_name = opp_id
+            if not opp_name:
+                opp_name = "Unknown"
 
             out.append({
-                "match_id": room_id,
+                "match_id": match_id,
                 "scheduled_ms": sched_ms,
                 "scheduled_local": _ms_to_local(sched_ms),
                 "opponent_id": opp_id,
                 "opponent_name": opp_name,
-                "match_url": f"{FACEIT_ROOM_BASE}/{room_id}" if room_id else "",
+                "match_url": f"{FACEIT_ROOM_BASE}/{match_id}" if match_id else "",
             })
 
         out.sort(key=lambda x: (x["scheduled_ms"] is None, x["scheduled_ms"]))
@@ -383,12 +462,6 @@ class EseaUpcoming(commands.Cog):
     # =========================
     # ALERT SCHEDULING (DB-backed)
     # =========================
-
-    def _should_send_now(self, alert_at_unix: int) -> bool:
-        # Send if within grace window around alert time.
-        # If it is too far in the past, we treat as missed and mark fired to prevent noise.
-        delta = _seconds_until(alert_at_unix)
-        return (-ALERT_GRACE_SECONDS <= delta <= 0.0) or (delta > 0.0)
 
     def _delay_seconds(self, alert_at_unix: int) -> float:
         return max(_seconds_until(alert_at_unix), 0.0)
@@ -497,12 +570,11 @@ class EseaUpcoming(commands.Cog):
             return
 
         try:
-            upcoming = await self._api.upcoming_created(TEAM_ID, CHAMPIONSHIP_ID)
+            upcoming = await self._api.upcoming_scheduled(TEAM_ID, CHAMPIONSHIP_ID)
         except Exception:
             return
 
         now = _now_unix()
-        seen_ids: Set[str] = set()
 
         async with self._db_lock:
             for m in upcoming:
@@ -510,8 +582,6 @@ class EseaUpcoming(commands.Cog):
                 sched_ms = m.get("scheduled_ms")
                 if not match_id:
                     continue
-
-                seen_ids.add(match_id)
 
                 alert_unix: Optional[int] = None
                 if isinstance(sched_ms, int):
@@ -590,37 +660,8 @@ class EseaUpcoming(commands.Cog):
             await interaction.followup.send("No upcoming matches scheduled for crescent.", ephemeral=False)
             return
 
-        lines: List[str] = []
         now = _now_unix()
-
-        for r in rows:
-            opp = r.get("opponent_name") or "Unknown"
-            url = r.get("match_url") or ""
-            sched_ms = r.get("scheduled_ms")
-            fired = r.get("fired_unix")
-
-            if isinstance(sched_ms, int):
-                start_unix = int(sched_ms // 1000)
-                match_rel = f"<t:{start_unix}:R>"
-            else:
-                start_unix = None
-                match_rel = "TBD"
-
-            alert_at = r.get("alert_at_unix")
-            # Scheduled if we have an alert time and it has not been fired and it is not way past grace.
-            if fired is not None:
-                alert_flag = "✅"  # already fired, which is good from an idempotency perspective
-            elif alert_at is None:
-                alert_flag = "❌"
-            else:
-                # If it is far in the past, it will be marked fired on next poller execution.
-                delta = alert_at - now
-                alert_flag = "✅" if delta >= -ALERT_GRACE_SECONDS else "❌"
-
-            if url:
-                lines.append(f"• **{opp}** • {match_rel} • alert: {alert_flag} • [room]({url})")
-            else:
-                lines.append(f"• **{opp}** • {match_rel} • alert: {alert_flag}")
+        lines = [_upcoming_line(row, now) for row in rows]
 
         embed = discord.Embed(
             title=f"{TITLE_BASE} ({crescent_w}W - {crescent_l}L) • upcoming matches",

@@ -12,8 +12,8 @@ import aiohttp
 # =========================
 OUTPUT_TZ       = "America/New_York"
 TEAM_ID         = "15c9a36f-8169-49eb-a41b-0a0e7567ed37"      # crescent
-CHAMPIONSHIP_ID = "f5856452-1bea-458d-acf2-69ab4d512f75"      # ESEA S56 NA Main Central
-DIVISION_ID     = "06d1cb8e-9859-4e85-916c-cd0a826f2ae0"      # division used by placements API
+CHAMPIONSHIP_ID = "840b4960-f24c-4d79-8fad-3fe551683034"      # ESEA S57 NA Main Central
+DIVISION_ID     = "a4ec16e0-348c-455c-aaf3-96711737c397"      # division used by placements API
 
 # =========================
 # ENDPOINTS
