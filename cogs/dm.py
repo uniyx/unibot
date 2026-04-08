@@ -12,18 +12,17 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+
 # =========================
 # DEV GUILD DECORATOR
 # =========================
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
-
 # -----------------------
 # CONFIG from environment
 # -----------------------
 REGION = "na"
-SERVERS_RAW = os.getenv("DM_SERVERS", "").strip()
+SERVERS_RAW = env_str("DM_SERVERS")
 SERVERS: List[str] = [
     nick.strip()
     for nick in SERVERS_RAW.split(",")
@@ -44,7 +43,7 @@ OUTPUT_TZ = ZoneInfo("America/New_York")
 EMBED_COLOR = 0x0C9547
 
 PROFILE_URLS: Dict[str, str] = json.loads(
-    os.getenv("STEAM_PROFILE_MAP", "{}")
+    env_str("STEAM_PROFILE_MAP", "{}")
 )
 
 # Derived: SteamID64 -> nickname (and display order)

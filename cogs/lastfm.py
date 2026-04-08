@@ -1,6 +1,5 @@
 # cogs/lastfm.py
 
-import os
 import io
 import math
 import asyncio
@@ -13,12 +12,15 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-LASTFM_API_KEY = os.getenv("LASTFM_API_KEY", "").strip()
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+
+
+LASTFM_API_KEY = env_str("LASTFM_API_KEY")
 if not LASTFM_API_KEY:
     raise RuntimeError("Set LASTFM_API_KEY in environment to use the Last.fm cog")
 
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-GUILDS = app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
+GUILDS = guilds_decorator()
 
 # Map Last.fm API periods
 _PERIOD_MAP: Dict[str, str] = {

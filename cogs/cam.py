@@ -9,6 +9,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+
 
 # -------------------------
 # Single-URL extractor
@@ -49,15 +52,11 @@ def _extract_single_rtsp(env_value: str) -> Optional[str]:
 # CONFIG
 # -------------------------
 
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
-
 # Single secret env that contains the RTSP URL
-CAM_RTSP_URL = _extract_single_rtsp(os.getenv("CAM_CAMERAS", ""))  # the only secret you need
+CAM_RTSP_URL = _extract_single_rtsp(env_str("CAM_CAMERAS"))  # the only secret you need
 
-FFMPEG_BIN = os.getenv("FFMPEG_BIN", "ffmpeg")
-SNAPSHOT_TIMEOUT = float(os.getenv("CAM_SNAPSHOT_TIMEOUT", "8"))
+FFMPEG_BIN = env_str("FFMPEG_BIN", "ffmpeg")
+SNAPSHOT_TIMEOUT = float(env_str("CAM_SNAPSHOT_TIMEOUT", "8"))
 
 
 class Camera(commands.Cog):

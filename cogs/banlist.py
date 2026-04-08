@@ -1,26 +1,33 @@
 import asyncio
-import os
 import sqlite3
 import threading
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
-from urllib.parse import quote
+from typing import Dict, List, Optional
 
 import discord
-import requests
-from curl_cffi import requests as curl_requests
 from discord import app_commands
 from discord.ext import commands
 
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+from core.faceit_utils import (
+    fetch_grouped_matches,
+    fetch_match_details,
+    fetch_player_by_id,
+    fetch_player_by_nickname,
+    fetch_recent_match_id,
+    find_ongoing_match,
+    parse_iso8601_utc,
+    resolve_player_id,
+    resolve_player_nickname,
+    to_discord_relative_timestamp,
+    to_iso8601_utc,
+)
+from core.sqlite_utils import connect_sqlite
 
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-BANLIST_DB_PATH = os.getenv("BANLIST_DB_PATH", "data/faceit_banlist.sqlite3")
+BANLIST_DB_PATH = env_str("BANLIST_DB_PATH", "data/faceit_banlist.sqlite3")
 GAME = "cs2"
 THEME_COLOR = 0xFF5500
-
-
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
 
 
 class ApiCounter:
@@ -36,20 +43,6 @@ class ApiCounter:
     def value(self) -> int:
         with self._lock:
             return self._count
-
-
-def _ensure_db_dir(path: str) -> None:
-    db_dir = os.path.dirname(path)
-    if db_dir:
-        os.makedirs(db_dir, exist_ok=True)
-
-
-def _connect_db(path: str) -> sqlite3.Connection:
-    _ensure_db_dir(path)
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
 
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
@@ -120,151 +113,21 @@ def _get_banlist_players(conn: sqlite3.Connection) -> List[Dict[str, str]]:
     ]
 
 
-def get_player_by_nickname(api_key: str, nickname: str, counter: ApiCounter) -> dict:
-    counter.inc()
-
-    url = f"https://open.faceit.com/data/v4/players?nickname={quote(nickname)}"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-    }
-
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_player_by_id(api_key: str, player_id: str, counter: ApiCounter) -> dict:
-    counter.inc()
-
-    url = f"https://open.faceit.com/data/v4/players/{quote(player_id)}"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-    }
-
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_grouped_matches(player_id: str, counter: ApiCounter) -> dict:
-    counter.inc()
-
-    url = (
-        "https://www.faceit.com/api/match/v4/matches/groupByState"
-        f"?userId={quote(player_id)}"
+def _remove_player_by_id(conn: sqlite3.Connection, player_id: str) -> bool:
+    cursor = conn.execute(
+        "DELETE FROM faceit_banlist WHERE player_id = ?",
+        (player_id,),
     )
-    headers = {
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Referer": "https://www.faceit.com/",
-        "Origin": "https://www.faceit.com",
-    }
-
-    resp = curl_requests.get(
-        url,
-        headers=headers,
-        impersonate="chrome136",
-        timeout=20,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def find_ongoing_match(grouped_data: dict) -> dict | None:
-    payload = grouped_data.get("payload", {})
-
-    for state_name, matches in payload.items():
-        if "ongoing" in str(state_name).lower():
-            return matches[0] if matches else None
-
-        if isinstance(matches, list):
-            for match in matches:
-                status = str(match.get("status", "")).lower()
-                state = str(match.get("state", "")).lower()
-                if "ongoing" in status or "ongoing" in state:
-                    return match
-
-    return None
-
-
-def get_recent_match_id(api_key: str, player_id: str, counter: ApiCounter) -> str | None:
-    counter.inc()
-
-    url = (
-        f"https://open.faceit.com/data/v4/players/{player_id}/history"
-        f"?game={GAME}&offset=0&limit=1"
-    )
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-    }
-
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    data = resp.json()
-
-    items = data.get("items", [])
-    if not items:
-        return None
-
-    return items[0].get("match_id")
-
-
-def get_match_details(api_key: str, match_id: str, counter: ApiCounter) -> dict:
-    counter.inc()
-
-    url = f"https://open.faceit.com/data/v4/matches/{quote(match_id)}"
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-        "Accept": "application/json",
-    }
-
-    resp = requests.get(url, headers=headers, timeout=20)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def to_iso8601_utc(value: object) -> str | None:
-    if value is None:
-        return None
-
-    if isinstance(value, str):
-        return value
-
-    if isinstance(value, (int, float)):
-        return datetime.fromtimestamp(value, tz=timezone.utc).strftime(
-            "%Y-%m-%dT%H:%M:%SZ"
-        )
-
-    return str(value)
-
-
-def parse_iso8601_utc(value: str | None) -> datetime:
-    if not value:
-        return datetime.min.replace(tzinfo=timezone.utc)
-
-    return datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ").replace(
-        tzinfo=timezone.utc
-    )
-
-
-def to_discord_relative(value: str | None) -> str:
-    if not value:
-        return "unknown"
-    dt_value = parse_iso8601_utc(value)
-    if dt_value == datetime.min.replace(tzinfo=timezone.utc):
-        return "unknown"
-    return f"<t:{int(dt_value.timestamp())}:R>"
+    conn.commit()
+    return cursor.rowcount > 0
 
 
 def build_player_status(api_key: str, player_id: str, counter: ApiCounter) -> dict:
-    player = get_player_by_id(api_key, player_id, counter)
-    resolved_name = player.get("nickname") or player_id
-    resolved_player_id = player.get("player_id") or player.get("id") or player.get("user_id") or player_id
+    player = fetch_player_by_id(api_key, player_id, counter)
+    resolved_name = resolve_player_nickname(player, fallback=player_id)
+    resolved_player_id = resolve_player_id(player, fallback=player_id)
 
-    grouped_data = get_grouped_matches(str(resolved_player_id), counter)
+    grouped_data = fetch_grouped_matches(str(resolved_player_id), counter)
     ongoing_match = find_ongoing_match(grouped_data)
 
     if ongoing_match:
@@ -281,7 +144,12 @@ def build_player_status(api_key: str, player_id: str, counter: ApiCounter) -> di
             "createdAt": to_iso8601_utc(ongoing_match.get("createdAt")),
         }
 
-    recent_match_id = get_recent_match_id(api_key, str(resolved_player_id), counter)
+    recent_match_id = fetch_recent_match_id(
+        api_key,
+        str(resolved_player_id),
+        game=GAME,
+        counter=counter,
+    )
     if not recent_match_id:
         return {
             "nickname": resolved_name,
@@ -291,7 +159,7 @@ def build_player_status(api_key: str, player_id: str, counter: ApiCounter) -> di
             "message": "No recent matches found.",
         }
 
-    match_details = get_match_details(api_key, recent_match_id, counter)
+    match_details = fetch_match_details(api_key, recent_match_id, counter)
     finished_at = match_details.get("finishedAt") or match_details.get("finished_at")
 
     return {
@@ -322,7 +190,7 @@ def build_status_lines(results: List[dict]) -> tuple[List[str], List[str], List[
         for item in active_players
     ]
     inactive_lines = [
-        f"`{item['nickname']}` | last active {to_discord_relative(item.get('finishedAt'))}"
+        f"`{item['nickname']}` | last active {to_discord_relative_timestamp(item.get('finishedAt'))}"
         for item in inactive_players
     ]
     error_lines = [
@@ -336,7 +204,7 @@ def build_status_lines(results: List[dict]) -> tuple[List[str], List[str], List[
 class Banlist(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self.conn = _connect_db(BANLIST_DB_PATH)
+        self.conn = connect_sqlite(BANLIST_DB_PATH)
         self.db_lock = threading.Lock()
         _ensure_schema(self.conn)
 
@@ -348,11 +216,19 @@ class Banlist(commands.Cog):
 
     @guilds_decorator()
     @app_commands.command(name="banlist", description="Check FACEIT banlist activity or add a player by nickname")
-    @app_commands.describe(add="Optional FACEIT nickname to add to the stored banlist")
-    async def banlist(self, interaction: discord.Interaction, add: Optional[str] = None) -> None:
+    @app_commands.describe(
+        add="Optional FACEIT nickname to add to the stored banlist",
+        remove="Optional FACEIT nickname to remove from the stored banlist",
+    )
+    async def banlist(
+        self,
+        interaction: discord.Interaction,
+        add: Optional[str] = None,
+        remove: Optional[str] = None,
+    ) -> None:
         await interaction.response.defer()
 
-        api_key = os.getenv("FACEIT_API_KEY", "").strip()
+        api_key = env_str("FACEIT_API_KEY")
         if not api_key:
             await interaction.followup.send(
                 "FACEIT_API_KEY is not configured in `.env`.",
@@ -360,8 +236,19 @@ class Banlist(commands.Cog):
             )
             return
 
+        if add and remove:
+            await interaction.followup.send(
+                "Use either `add` or `remove`, not both in the same command.",
+                ephemeral=True,
+            )
+            return
+
         if add:
             await self._handle_add(interaction, api_key, add.strip())
+            return
+
+        if remove:
+            await self._handle_remove(interaction, api_key, remove.strip())
             return
 
         with self.db_lock:
@@ -443,7 +330,7 @@ class Banlist(commands.Cog):
         counter = ApiCounter()
 
         try:
-            player = await asyncio.to_thread(get_player_by_nickname, api_key, nickname, counter)
+            player = await asyncio.to_thread(fetch_player_by_nickname, api_key, nickname, counter)
         except Exception as exc:
             await interaction.followup.send(
                 f"Failed to resolve `{nickname}` on FACEIT: {exc}",
@@ -451,14 +338,15 @@ class Banlist(commands.Cog):
             )
             return
 
-        player_id = player.get("player_id") or player.get("id") or player.get("user_id")
-        resolved_name = player.get("nickname") or nickname
-        if not player_id:
+        try:
+            player_id = resolve_player_id(player, fallback=nickname)
+        except Exception:
             await interaction.followup.send(
                 f"FACEIT did not return a player ID for `{nickname}`.",
                 ephemeral=True,
             )
             return
+        resolved_name = resolve_player_nickname(player, fallback=nickname)
 
         with self.db_lock:
             created = _upsert_player(self.conn, str(player_id), str(resolved_name))
@@ -467,6 +355,51 @@ class Banlist(commands.Cog):
         embed = discord.Embed(
             title="FACEIT Banlist",
             description=f"{verb} `{resolved_name}` with player ID `{player_id}`.",
+            color=THEME_COLOR,
+        )
+        embed.set_footer(text=f"Total FACEIT API calls: {counter.value}")
+        await interaction.followup.send(embed=embed)
+
+    async def _handle_remove(
+        self,
+        interaction: discord.Interaction,
+        api_key: str,
+        nickname: str,
+    ) -> None:
+        counter = ApiCounter()
+
+        try:
+            player = await asyncio.to_thread(fetch_player_by_nickname, api_key, nickname, counter)
+        except Exception as exc:
+            await interaction.followup.send(
+                f"Failed to resolve `{nickname}` on FACEIT: {exc}",
+                ephemeral=True,
+            )
+            return
+
+        try:
+            player_id = resolve_player_id(player, fallback=nickname)
+        except Exception:
+            await interaction.followup.send(
+                f"FACEIT did not return a player ID for `{nickname}`.",
+                ephemeral=True,
+            )
+            return
+        resolved_name = resolve_player_nickname(player, fallback=nickname)
+
+        with self.db_lock:
+            removed = _remove_player_by_id(self.conn, str(player_id))
+
+        if not removed:
+            await interaction.followup.send(
+                f"`{resolved_name}` is not currently in the banlist.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="FACEIT Banlist",
+            description=f"Removed `{resolved_name}` with player ID `{player_id}`.",
             color=THEME_COLOR,
         )
         embed.set_footer(text=f"Total FACEIT API calls: {counter.value}")

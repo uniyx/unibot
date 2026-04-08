@@ -8,14 +8,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+from core.faceit_utils import FACEIT_BASE_V4, resolve_player_id, resolve_player_nickname
 
-
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
-
-
-FACEIT_BASE = "https://open.faceit.com/data/v4"
+FACEIT_BASE = FACEIT_BASE_V4
 FACEIT_ROOM_BASE = "https://www.faceit.com/en/cs2/room/"
 THEME_COLOR = 0xFF5500
 
@@ -64,13 +61,11 @@ class FaceitFCRAPI:
             label="players.resolve",
         )
 
-        player_id = data.get("player_id")
-        if not player_id:
-            raise RuntimeError(f"Could not resolve player_id for '{nickname}'")
+        player_id = resolve_player_id(data, fallback=nickname)
 
         return (
             player_id,
-            data.get("nickname", nickname),
+            resolve_player_nickname(data, fallback=nickname),
             data.get("faceit_url"),
             data.get("avatar"),
         )
@@ -258,7 +253,7 @@ class FCR(commands.Cog):
         matches: Optional[int] = 10,
         call: Optional[bool] = False,
     ) -> None:
-        api_key = os.getenv("FACEIT_API_KEY", "").strip()
+        api_key = env_str("FACEIT_API_KEY")
         if not api_key:
             await interaction.response.send_message(
                 "FACEIT_API_KEY is not set on the bot host. Set it and try again.",

@@ -7,6 +7,9 @@ from discord import app_commands
 from discord.ext import commands
 import aiohttp
 
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+
 # =========================
 # FIXED IDS (ESEA Main • crescent)
 # =========================
@@ -24,10 +27,6 @@ V4_BASE = "https://open.faceit.com/data/v4"
 # =========================
 # DISCORD SCOPING / STYLE
 # =========================
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
-
 THEME_COLOR = 0x0c9547
 TITLE_BASE  = "crescent <:crescent:855175620891508736>"
 
@@ -66,7 +65,7 @@ def _v1_headers() -> Dict[str, str]:
     return {"Accept": "application/json"}
 
 def _v4_headers() -> Dict[str, str]:
-    api_key = os.getenv("FACEIT_API_KEY", "").strip()
+    api_key = env_str("FACEIT_API_KEY")
     if not api_key:
         raise RuntimeError("FACEIT_API_KEY is required for v4 stats calls.")
     return {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
@@ -339,7 +338,7 @@ class EseaStats(commands.Cog):
         await interaction.response.defer(thinking=True)
 
         # v4 stats are required
-        if not os.getenv("FACEIT_API_KEY", "").strip():
+        if not env_str("FACEIT_API_KEY"):
             await interaction.followup.send(
                 "FACEIT_API_KEY is not set. The /esea stats path uses the Open v4 endpoints.",
                 ephemeral=True,

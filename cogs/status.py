@@ -12,6 +12,9 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+
 # Optional deps
 try:
     import psutil  # type: ignore
@@ -58,8 +61,8 @@ def _now_utc() -> dt.datetime:
 
 def _git_meta() -> Tuple[Optional[str], Optional[str], Optional[str]]:
     """Return (version_tag, short_sha, full_sha). Prefer env, fall back to git."""
-    ver = (os.getenv("UNIBOT_VERSION") or "").strip() or None
-    full = (os.getenv("GIT_SHA") or os.getenv("COMMIT_SHA") or "").strip() or None
+    ver = env_str("UNIBOT_VERSION") or None
+    full = env_str("GIT_SHA") or env_str("COMMIT_SHA") or None
     short = full[:7] if full else None
     if ver and full:
         return ver, short, full
@@ -78,12 +81,6 @@ def _git_meta() -> Tuple[Optional[str], Optional[str], Optional[str]]:
         short = full[:7] if full else short
     return ver, short, full
 
-# Guild scoping
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
-
-
 # ---- cog -------------------------------------------------------------------
 
 class StatusCog(commands.Cog):
@@ -101,7 +98,7 @@ class StatusCog(commands.Cog):
     @app_commands.describe(verbose="Include deep system details")
     async def status(self, interaction: discord.Interaction, verbose: Optional[bool] = False):
         t0 = time.perf_counter()
-        repo = os.getenv("REPO_URL", "https://github.com/uniyx/unibot").rstrip("/")
+        repo = env_str("REPO_URL", "https://github.com/uniyx/unibot").rstrip("/")
         embed = discord.Embed(title="unibot Status", color=discord.Color.blurple(), timestamp=_now_utc())
         embed.set_author(name="uniyx/unibot", url=repo)
 

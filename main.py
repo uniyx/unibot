@@ -1,33 +1,28 @@
 import asyncio
 import logging
-import os
 import socket
-from typing import Optional, Iterable, Dict
+from typing import Optional, Dict
 
 import discord
-from discord.ext import commands
-from dotenv import load_dotenv
 from aiohttp import web
+from discord.ext import commands
 
-load_dotenv()
+from core.config import env_optional_int, env_str
+from core.discord_utils import slash_only_prefix
 
-TOKEN = os.getenv("DISCORD_TOKEN", "").strip()
-DEV_GUILD_ID_ENV = os.getenv("DEV_GUILD_ID", "").strip()
-DEV_GUILD_ID: Optional[int] = int(DEV_GUILD_ID_ENV) if DEV_GUILD_ID_ENV else None
+
+TOKEN = env_str("DISCORD_TOKEN")
+DEV_GUILD_ID: Optional[int] = env_optional_int("DEV_GUILD_ID")
 
 if not TOKEN:
     raise RuntimeError("Set DISCORD_TOKEN in .env")
 if not DEV_GUILD_ID:
     raise RuntimeError("Set DEV_GUILD_ID in .env to use guild-scoped commands")
 
-HEALTH_PORT = int(os.getenv("HEALTH_PORT", "6969"))
-INSTANCE_TAG = os.getenv("INSTANCE_TAG", "vm")
+HEALTH_PORT = env_optional_int("HEALTH_PORT") or 6969
+INSTANCE_TAG = env_str("INSTANCE_TAG", "vm")
 
 intents = discord.Intents.default()  # slash only
-
-def slash_only_prefix(_bot: commands.Bot, _msg: discord.Message) -> Iterable[str]:
-    # Must return a string or iterable, never None. Empty iterable disables text commands.
-    return []
 
 # Shared health state mutated by lifecycle events
 _health: Dict[str, object] = {

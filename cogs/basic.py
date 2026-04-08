@@ -6,8 +6,10 @@ from discord import app_commands
 from discord.ext import commands
 from typing import List
 
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-GUILDS = app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
+from core.discord_utils import guilds_decorator
+
+
+GUILDS = guilds_decorator()
 
 # Directory containing images
 BASE_DIR = "/unibot"

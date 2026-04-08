@@ -11,32 +11,29 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from core.config import env_int, env_str
+from core.discord_utils import guilds_decorator
+from core.sqlite_utils import connect_sqlite
+
 # =========================
 # CONFIG
 # =========================
 
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
+TEAM_ROLE_ID = env_int("TEAM_ROLE_ID", 0)
+TEAM_CHANNEL_ID = env_int("TEAM_CHANNEL_ID", 0)
 
-TEAM_ROLE_ID = int(os.getenv("TEAM_ROLE_ID", "0"))
-TEAM_CHANNEL_ID = int(os.getenv("TEAM_CHANNEL_ID", "0"))
+REMIND_DB_PATH = env_str("REMIND_DB_PATH", "data/reminders.sqlite3")
+REMIND_TZ = env_str("REMIND_TZ", "America/New_York")
+REMIND_POLL_SECONDS = env_int("REMIND_POLL_SECONDS", 10)
 
-REMIND_DB_PATH = os.getenv("REMIND_DB_PATH", "data/reminders.sqlite3")
-REMIND_TZ = os.getenv("REMIND_TZ", "America/New_York")
-REMIND_POLL_SECONDS = int(os.getenv("REMIND_POLL_SECONDS", "10"))
-
-REMIND_EMBED_COLOR = os.getenv("REMIND_EMBED_COLOR", "#5865F2")
+REMIND_EMBED_COLOR = env_str("REMIND_EMBED_COLOR", "#5865F2")
 
 # Daily midnight post of upcoming reminders
-REMIND_DAILY_LIMIT = int(os.getenv("REMIND_DAILY_LIMIT", "10"))
+REMIND_DAILY_LIMIT = env_int("REMIND_DAILY_LIMIT", 10)
 # default off; enable explicitly if you really want it
-REMIND_DAILY_PING_ROLE = os.getenv("REMIND_DAILY_PING_ROLE", "0").strip() == "1"
+REMIND_DAILY_PING_ROLE = env_str("REMIND_DAILY_PING_ROLE", "0") == "1"
 
 LEAD_SECONDS = 30 * 60  # 30 minutes
-
-
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
-
 
 # =========================
 # HELPERS
@@ -299,7 +296,7 @@ class Remind(commands.Cog):
         if os.path.dirname(REMIND_DB_PATH):
             os.makedirs(os.path.dirname(REMIND_DB_PATH), exist_ok=True)
 
-        self.conn = sqlite3.connect(REMIND_DB_PATH, check_same_thread=False)
+        self.conn = connect_sqlite(REMIND_DB_PATH)
         _ensure_db(self.conn)
 
         self.remind_poller.change_interval(seconds=max(2, REMIND_POLL_SECONDS))

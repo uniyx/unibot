@@ -1,12 +1,13 @@
-import os
 import asyncio
 from statistics import mean
 from typing import Optional, Any, List
 
 import aiohttp
 
-# Hardcoded player id for "uni"
-PLAYER_ID = "cdcb07db-ccb7-4c00-933a-605b01094a79"
+from core.config import env_str
+
+
+PLAYER_ID = env_str("FACEIT_TEST_PLAYER_ID", "cdcb07db-ccb7-4c00-933a-605b01094a79")
 
 FACEIT_DATA_BASE = "https://open.faceit.com/data/v4"
 SCOREBOARD_BASE = "https://www.faceit.com/api/statistics/v1"
@@ -69,8 +70,7 @@ async def fetch_match_rws(session: aiohttp.ClientSession, match_id: str) -> Opti
 
 
 async def main():
-    # Either set FACEIT_API_KEY in your env, or replace this line with a hardcoded key.
-    api_key = "5bc2b8e5-4b00-452b-80a2-afc032a1b92c"
+    api_key = env_str("FACEIT_API_KEY")
     if not api_key:
         raise SystemExit("FACEIT_API_KEY is not set in the environment.")
 

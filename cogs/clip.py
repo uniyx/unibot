@@ -1,6 +1,5 @@
 # cogs/clip.py
 
-import os
 import random
 import datetime as dt
 from typing import Any, Dict, List, Optional
@@ -10,61 +9,28 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+from core.faceit_utils import FaceitApiError, fetch_json, resolve_player_id_async
+
 # =========================
 # CONFIG
 # =========================
 
-FACEIT_BASE_V4 = "https://open.faceit.com/data/v4"
 ALLSTAR_BASE = "https://www.faceit.com/api/allstar/v1/games/cs2"
 
-FACEIT_API_KEY = os.getenv("FACEIT_API_KEY")
-
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-
-
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
-
-
-# =========================
-# HELPERS
-# =========================
-
-class FaceitApiError(RuntimeError):
-    pass
-
-
-async def fetch_json(
-    session: aiohttp.ClientSession,
-    url: str,
-    *,
-    headers: Optional[Dict[str, str]] = None,
-    params: Optional[Dict[str, Any]] = None,
-) -> Any:
-    async with session.get(url, headers=headers, params=params, timeout=10) as resp:
-        if resp.status != 200:
-            text = await resp.text()
-            raise FaceitApiError(f"HTTP {resp.status} for {url}: {text[:200]}")
-        return await resp.json()
+FACEIT_API_KEY = env_str("FACEIT_API_KEY")
 
 
 async def get_player_id(session: aiohttp.ClientSession, nickname: str) -> str:
-    """
-    Resolve a FACEIT nickname to its player_id via v4 players endpoint.
-    """
     if not FACEIT_API_KEY:
         raise FaceitApiError("FACEIT_API_KEY is not configured")
-
-    headers = {"Authorization": f"Bearer {FACEIT_API_KEY}"}
-    url = f"{FACEIT_BASE_V4}/players"
-    params = {"nickname": nickname}
-
-    data = await fetch_json(session, url, headers=headers, params=params)
-
-    player_id = data.get("player_id")
-    if not player_id:
-        raise FaceitApiError(f"Could not resolve FACEIT player_id for nickname '{nickname}'")
-    return player_id
+    return await resolve_player_id_async(
+        session,
+        FACEIT_API_KEY,
+        nickname,
+        error_factory=FaceitApiError,
+    )
 
 
 def clip_mp4_from_thumbnail(clip: Dict[str, Any]) -> Optional[str]:

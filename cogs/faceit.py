@@ -10,11 +10,11 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+from core.faceit_utils import FACEIT_BASE_V4
 
-FACEIT_BASE = "https://open.faceit.com/data/v4"
+FACEIT_BASE = FACEIT_BASE_V4
 
 KD_KEYS = ["Average K/D Ratio", "K/D Ratio", "K/D"]
 ADR_KEYS = ["Average Damage/Round", "ADR", "Average Damage per Round"]
@@ -24,7 +24,7 @@ THEME_COLOR = 0xFF5500
 # -----------------------
 # Roster from environment
 # -----------------------
-FACEIT_ROSTER_RAW = os.getenv("FACEIT_ROSTER", "").strip()
+FACEIT_ROSTER_RAW = env_str("FACEIT_ROSTER")
 ROSTER: List[str] = [nick.strip() for nick in FACEIT_ROSTER_RAW.split(",") if nick.strip()]
 
 # -----------------------
@@ -287,7 +287,7 @@ class FaceitStats(commands.Cog):
         last_matches: Optional[int] = None,
         call: Optional[bool] = False,
     ):
-        api_key = os.getenv("FACEIT_API_KEY", "").strip()
+        api_key = env_str("FACEIT_API_KEY")
         if not api_key:
             await interaction.response.send_message(
                 "FACEIT_API_KEY is not set on the bot host. Set it and try again.",

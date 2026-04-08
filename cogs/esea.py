@@ -11,6 +11,10 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from zoneinfo import ZoneInfo
 
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+from core.sqlite_utils import connect_sqlite
+
 # =========================
 # CONFIG
 # =========================
@@ -26,10 +30,6 @@ THEME_COLOR = 0x0c9547
 TITLE_BASE  = "crescent <:crescent:855175620891508736>"
 
 # Guild scoping
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
-
 # Alerts
 ROLE_ID             = 1432855602224304258      # role to ping
 ALERT_CHANNEL_ID    = 1430384084802211952      # channel to send alerts
@@ -43,7 +43,7 @@ ALERT_GRACE_SECONDS = 90          # after fire time, do not send again past this
 RESCHEDULE_JITTER_S = 2           # if alert time changes within this, keep existing task
 
 # SQLite
-ESEA_DB_PATH = os.getenv("ESEA_DB_PATH", "data/esea.sqlite3")
+ESEA_DB_PATH = env_str("ESEA_DB_PATH", "data/esea.sqlite3")
 
 # Garbage collection
 STALE_SEEN_HOURS = 24
@@ -105,18 +105,6 @@ def _to_timestamp_ms(value: Any) -> Optional[int]:
 # =========================
 # SQLITE HELPERS
 # =========================
-
-def _ensure_db_dir(path: str) -> None:
-    d = os.path.dirname(path)
-    if d:
-        os.makedirs(d, exist_ok=True)
-
-def _connect_db(path: str) -> sqlite3.Connection:
-    _ensure_db_dir(path)
-    conn = sqlite3.connect(path, check_same_thread=False)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA synchronous=NORMAL")
-    return conn
 
 def _ensure_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
@@ -426,7 +414,7 @@ class EseaUpcoming(commands.Cog):
         self.session: Optional[aiohttp.ClientSession] = None
         self._api: Optional[FaceitV1Client] = None
 
-        self._conn = _connect_db(ESEA_DB_PATH)
+        self._conn = connect_sqlite(ESEA_DB_PATH)
         _ensure_schema(self._conn)
 
         # match_id -> asyncio.Task (execution only)

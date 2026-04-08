@@ -12,16 +12,12 @@ import discord
 from discord import app_commands
 from discord.ext import commands, tasks
 
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+
 # =========================
 # CONFIG PATHS AND CONSTANTS
 # =========================
-
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-
-
-def guilds_decorator():
-    return app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
-
 
 # CSGOTrader csfloat API
 PRICES_LOCAL_FILE = Path("/unibot/data/prices.json")
@@ -42,7 +38,7 @@ class Inv(commands.Cog):
         self.bot = bot
 
         # For persona name, avatar, and vanity resolution; cog still works without it
-        self.steam_token = os.getenv("STEAM_TOKEN")
+        self.steam_token = env_str("STEAM_TOKEN") or None
 
         # prices: market_hash_name -> float
         self.prices: Dict[str, float] = {}

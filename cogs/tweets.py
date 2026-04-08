@@ -10,16 +10,18 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from core.config import env_str
+from core.discord_utils import guilds_decorator
+
 # Configure via env:
 # DEV_GUILD_ID         → your dev server for instant slash visibility
 # TWEETS_JS_PATH       → absolute or relative path to tweets.js (archive file)
 # TWITTER_USERNAME     → your handle without @ (e.g., uniyx)
-DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0")) or None
-GUILDS = app_commands.guilds(discord.Object(id=DEV_GUILD_ID)) if DEV_GUILD_ID else (lambda f: f)
+GUILDS = guilds_decorator()
 
 BASE_DIR = "/unibot"
 TWEETS_PATH = os.path.join(BASE_DIR, "data", "tweets.js")
-TWITTER_USERNAME = os.getenv("TWITTER_USERNAME", "").strip()
+TWITTER_USERNAME = env_str("TWITTER_USERNAME")
 
 _ASSIGNMENT_PREFIX = re.compile(r"^[^{\[]*=\s*", re.DOTALL)
 
