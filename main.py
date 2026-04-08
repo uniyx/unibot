@@ -72,7 +72,6 @@ class UniBot(commands.Bot):
             "cogs.basic",
             "cogs.status",
             "cogs.tweets",
-            "cogs.portfolio",
             "cogs.faceit",
             "cogs.banlist",
             "cogs.fcr",
