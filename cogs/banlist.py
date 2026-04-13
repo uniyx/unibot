@@ -28,6 +28,7 @@ from core.sqlite_utils import connect_sqlite
 BANLIST_DB_PATH = env_str("BANLIST_DB_PATH", "data/faceit_banlist.sqlite3")
 GAME = "cs2"
 THEME_COLOR = 0xFF5500
+FACEIT_ROOM_BASE = "https://www.faceit.com/en/cs2/room/"
 
 
 class ApiCounter:
@@ -186,7 +187,11 @@ def build_status_lines(results: List[dict]) -> tuple[List[str], List[str], List[
     )
 
     active_lines = [
-        f"`{item['nickname']}`"
+        (
+            f"[{item['nickname']}]({FACEIT_ROOM_BASE}{item['matchId']})"
+            if item.get("matchId")
+            else f"`{item['nickname']}`"
+        )
         for item in active_players
     ]
     inactive_lines = [
