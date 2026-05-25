@@ -433,6 +433,7 @@ class FaceitStats(commands.Cog):
                     rating_val = None
                     rating_t_val = None
                     rating_ct_val = None
+                    rating_matches = None
 
                     try:
                         rec = await api.get_recent_stats_batch(pid, limit=last_matches or 30)
@@ -452,11 +453,6 @@ class FaceitStats(commands.Cog):
                         rating_t_val = ratings.get("faceit_rating_t")
                         rating_ct_val = ratings.get("faceit_rating_ct")
                         rating_matches = int(ratings.get("matches_count") or 0)
-                        requested_matches = last_matches or 30
-                        if requested_matches > rating_matches > 0:
-                            errors.append(
-                                f"{name}: FACEIT rating endpoint returned {rating_matches} matches; rating column uses those matches."
-                            )
                     except Exception as e:
                         errors.append(f"{name}: failed recent FACEIT rating lookup ({e})")
                 else:
@@ -466,6 +462,7 @@ class FaceitStats(commands.Cog):
                     rating_val = None
                     rating_t_val = None
                     rating_ct_val = None
+                    rating_matches = None
 
                 ranking: Optional[int] = None
                 try:
@@ -482,6 +479,7 @@ class FaceitStats(commands.Cog):
                     "rating": rating_val,
                     "rating_t": rating_t_val,
                     "rating_ct": rating_ct_val,
+                    "rating_matches": rating_matches,
                     "ranking": ranking,
                     "url": url,
                     "avatar": avatar,
@@ -495,13 +493,27 @@ class FaceitStats(commands.Cog):
 
         rows.sort(key=lambda r: (r["elo_num"] is None, -(r["elo_num"] or -1)))
 
+        rating_match_counts = [
+            int(r["rating_matches"]) for r in rows
+            if _num_or_none(r.get("rating_matches")) is not None and int(r["rating_matches"]) > 0
+        ]
+        rating_scope = None
+        if use_recent and last_matches and rating_match_counts:
+            max_rating_matches = max(rating_match_counts)
+            if last_matches > max_rating_matches:
+                rating_scope = max_rating_matches
+
+        rating_label = f"FR{rating_scope}" if rating_scope else "FR"
+        extended_rating_label = f"{rating_label}/T/CT"
+
         name_w = max(6, min(10, max((len(r["name"]) for r in rows), default=6)))
         elo_w = max(3, max((len(_fmt_int(r["elo"])) for r in rows), default=3))
         kd_w = max(3, max((len(_fmt_fixed(r["kd"])) for r in rows), default=3))
         adr_w = max(3, max((len(_fmt_fixed(r["adr"], 1)) for r in rows), default=3))
-        rating_w = max(2, max((
+        rating_header = extended_rating_label if extended else rating_label
+        rating_w = max(len(rating_header), max((
             len(_fmt_rating(r["rating"], r["rating_t"], r["rating_ct"], extended=bool(extended))) for r in rows
-        ), default=2))
+        ), default=0))
         ranking_w = max(2, max((len(_fmt_int(r["ranking"])) for r in rows), default=2))
 
         scope_label = f"Last {last_matches}" if use_recent else "Lifetime"
@@ -510,7 +522,7 @@ class FaceitStats(commands.Cog):
             header = (
                 f"{'Player':<{name_w}} "
                 f"{'ELO':>{elo_w}} {'K/D':>{kd_w}} {'ADR':>{adr_w}} "
-                f"{'FR/T/CT':>{rating_w}} {'NA':>{ranking_w}}"
+                f"{rating_header:>{rating_w}} {'NA':>{ranking_w}}"
             )
             sep = (
                 f"{'-' * name_w} "
@@ -520,7 +532,7 @@ class FaceitStats(commands.Cog):
         else:
             header = (
                 f"{'Player':<{name_w}} "
-                f"{'ELO':>{elo_w}} {'FR':>{rating_w}} {'ADR':>{adr_w}} "
+                f"{'ELO':>{elo_w}} {rating_header:>{rating_w}} {'ADR':>{adr_w}} "
                 f"{'NA':>{ranking_w}}"
             )
             sep = (
