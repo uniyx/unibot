@@ -9,12 +9,14 @@ import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
+from curl_cffi import requests as curl_requests
 
 from core.config import env_str
 from core.discord_utils import guilds_decorator
 from core.faceit_utils import FACEIT_BASE_V4
 
 FACEIT_BASE = FACEIT_BASE_V4
+FACEIT_STATS_BASE = "https://www.faceit.com/api/statistics/v1"
 
 KD_KEYS = ["Average K/D Ratio", "K/D Ratio", "K/D"]
 ADR_KEYS = ["Average Damage/Round", "ADR", "Average Damage per Round"]
@@ -47,6 +49,23 @@ def _fmt_fixed(x: Any, digits: int = 2) -> str:
     if v is None:
         return "n/a"
     return f"{v:.{digits}f}"
+
+def _fmt_rating_triplet(rating: Any, rating_t: Any, rating_ct: Any) -> str:
+    values = [_num_or_none(rating), _num_or_none(rating_t), _num_or_none(rating_ct)]
+    if all(v is None for v in values):
+        return "n/a"
+    return "/".join(f"{v:.2f}" if v is not None else "-" for v in values)
+
+def _fmt_rating(rating: Any, rating_t: Any, rating_ct: Any, *, extended: bool = False) -> str:
+    if extended:
+        return _fmt_rating_triplet(rating, rating_t, rating_ct)
+    return _fmt_fixed(rating)
+
+def _clip_text(value: Any, max_len: int) -> str:
+    text = str(value or "")
+    if len(text) <= max_len:
+        return text
+    return text[:max(0, max_len - 1)] + "."
 
 def _safe_url(u: Optional[str]) -> Optional[str]:
     if not u:
@@ -88,6 +107,7 @@ class FaceitAPI:
         self._cache_resolve: Dict[str, Tuple[str, str, Optional[int], Optional[str], Optional[str]]] = {}
         self._cache_lifetime: Dict[str, Dict[str, str]] = {}
         self._cache_recent_batch: Dict[Tuple[str, int], Dict[str, Any]] = {}
+        self._cache_recent_ratings: Dict[Tuple[str, int], Dict[str, Any]] = {}
         self._cache_ranking: Dict[Tuple[str, str, str, Optional[str]], Optional[int]] = {}
 
     async def _get_json(
@@ -125,6 +145,50 @@ class FaceitAPI:
                     return await r.json()
 
         raise RuntimeError("Exhausted retries to FACEIT API")
+
+    async def _get_public_json(
+        self,
+        url: str,
+        params: Optional[dict] = None,
+        *,
+        retries: int = 3,
+        label: str = "unknown",
+    ) -> dict:
+        backoff = 0.75
+        headers = {
+            "Accept": "application/json",
+            "Referer": "https://www.faceit.com/",
+            "Origin": "https://www.faceit.com",
+        }
+
+        for attempt in range(retries):
+            async with self.sem:
+                self.counter.inc(label)
+
+                def fetch() -> dict:
+                    response = curl_requests.get(
+                        url,
+                        params=params,
+                        headers=headers,
+                        impersonate="chrome136",
+                        timeout=30,
+                    )
+                    if response.status_code >= 400:
+                        raise RuntimeError(
+                            f"FACEIT GET {url} failed [{response.status_code}]: {response.text[:200]}"
+                        )
+                    return response.json()
+
+                try:
+                    return await asyncio.to_thread(fetch)
+                except Exception:
+                    if attempt >= retries - 1:
+                        raise
+
+            await asyncio.sleep(backoff)
+            backoff *= 2
+
+        raise RuntimeError("Exhausted retries to FACEIT public API")
 
     async def resolve_player(self, nickname: str) -> Tuple[str, str, Optional[int], Optional[str], Optional[str]]:
         if nickname in self._cache_resolve:
@@ -214,6 +278,39 @@ class FaceitAPI:
         self._cache_recent_batch[cache_key] = out
         return out
 
+    async def get_recent_ratings_batch(self, player_id: str, limit: int = 30) -> Dict[str, Any]:
+        limit = max(1, min(100, int(limit)))
+        cache_key = (player_id, limit)
+        if cache_key in self._cache_recent_ratings:
+            return self._cache_recent_ratings[cache_key]
+
+        url = f"{FACEIT_STATS_BASE}/cs2/players/{player_id}/match-rounds"
+        data = await self._get_public_json(
+            url,
+            params={"limit": limit},
+            label="statistics.match_rounds",
+        )
+        rounds = (
+            data.get("payload", {})
+                .get("cs2", {})
+                .get("match_rounds", [])
+        )
+        rounds = rounds[:limit]
+
+        def avg_field(field: str) -> Optional[float]:
+            values = [_num_or_none(item.get(field)) for item in rounds if isinstance(item, dict)]
+            values = [v for v in values if v is not None]
+            return mean(values) if values else None
+
+        out = {
+            "faceit_rating": avg_field("faceit_rating"),
+            "faceit_rating_t": avg_field("faceit_rating_t"),
+            "faceit_rating_ct": avg_field("faceit_rating_ct"),
+            "matches_count": len(rounds),
+        }
+        self._cache_recent_ratings[cache_key] = out
+        return out
+
     async def get_global_ranking(
         self,
         player_id: str,
@@ -271,12 +368,13 @@ class FaceitStats(commands.Cog):
     @guilds_decorator()
     @app_commands.command(
         name="faceit",
-        description="FACEIT CS2 ELO, K/D, ADR, and global ranking for a user or the roster (default: last 30 matches)."
+        description="FACEIT CS2 ELO, FACEIT rating, ADR, and global ranking for a user or the roster."
     )
     @app_commands.describe(
         user="Optional FACEIT nickname. If omitted, uses the FACEIT_ROSTER from the environment.",
         lifetime="If true, show lifetime stats instead of recent matches.",
         last_matches="If set, show stats over the last N matches (1 to 100). Overrides the default 30.",
+        extended="If true, include K/D and show FACEIT rating as overall/T/CT.",
         call="If true, append API call breakdown (includes retries)."
     )
     async def faceit(
@@ -285,6 +383,7 @@ class FaceitStats(commands.Cog):
         user: Optional[str] = None,
         lifetime: Optional[bool] = False,
         last_matches: Optional[int] = None,
+        extended: Optional[bool] = False,
         call: Optional[bool] = False,
     ):
         api_key = env_str("FACEIT_API_KEY")
@@ -331,6 +430,10 @@ class FaceitStats(commands.Cog):
                 elo_num = _num_or_none(elo_raw)
 
                 if use_recent:
+                    rating_val = None
+                    rating_t_val = None
+                    rating_ct_val = None
+
                     try:
                         rec = await api.get_recent_stats_batch(pid, limit=last_matches or 30)
                         kd_val = rec["kd"]
@@ -342,10 +445,27 @@ class FaceitStats(commands.Cog):
                         errors.append(
                             f"{name}: failed recent batch stats for last {last_matches} matches, fell back to lifetime ({e})"
                         )
+
+                    try:
+                        ratings = await api.get_recent_ratings_batch(pid, limit=last_matches or 30)
+                        rating_val = ratings.get("faceit_rating")
+                        rating_t_val = ratings.get("faceit_rating_t")
+                        rating_ct_val = ratings.get("faceit_rating_ct")
+                        rating_matches = int(ratings.get("matches_count") or 0)
+                        requested_matches = last_matches or 30
+                        if requested_matches > rating_matches > 0:
+                            errors.append(
+                                f"{name}: FACEIT rating endpoint returned {rating_matches} matches; rating column uses those matches."
+                            )
+                    except Exception as e:
+                        errors.append(f"{name}: failed recent FACEIT rating lookup ({e})")
                 else:
                     life = await api.get_lifetime_stats(pid)
                     kd_val = _num_or_none(api.pick_key(life, KD_KEYS))
                     adr_val = _num_or_none(api.pick_key(life, ADR_KEYS))
+                    rating_val = None
+                    rating_t_val = None
+                    rating_ct_val = None
 
                 ranking: Optional[int] = None
                 try:
@@ -359,6 +479,9 @@ class FaceitStats(commands.Cog):
                     "elo_num": elo_num,
                     "kd": kd_val,
                     "adr": adr_val,
+                    "rating": rating_val,
+                    "rating_t": rating_t_val,
+                    "rating_ct": rating_ct_val,
                     "ranking": ranking,
                     "url": url,
                     "avatar": avatar,
@@ -372,31 +495,58 @@ class FaceitStats(commands.Cog):
 
         rows.sort(key=lambda r: (r["elo_num"] is None, -(r["elo_num"] or -1)))
 
-        idx_w = len(str(len(rows))) if rows else 1
-        name_w = max(5, max((len(r["name"]) for r in rows), default=5))
+        name_w = max(6, min(10, max((len(r["name"]) for r in rows), default=6)))
         elo_w = max(3, max((len(_fmt_int(r["elo"])) for r in rows), default=3))
         kd_w = max(3, max((len(_fmt_fixed(r["kd"])) for r in rows), default=3))
-        adr_w = max(3, max((len(_fmt_fixed(r["adr"])) for r in rows), default=3))
-        ranking_w = max(4, max((len(_fmt_int(r["ranking"])) for r in rows), default=4))
+        adr_w = max(3, max((len(_fmt_fixed(r["adr"], 1)) for r in rows), default=3))
+        rating_w = max(2, max((
+            len(_fmt_rating(r["rating"], r["rating_t"], r["rating_ct"], extended=bool(extended))) for r in rows
+        ), default=2))
+        ranking_w = max(2, max((len(_fmt_int(r["ranking"])) for r in rows), default=2))
 
         scope_label = f"Last {last_matches}" if use_recent else "Lifetime"
 
-        header = (
-            f"{'#':>{idx_w}}  {'Player':<{name_w}}  "
-            f"{'ELO':>{elo_w}}  {'K/D':>{kd_w}}  {'ADR':>{adr_w}}  {'Rank':>{ranking_w}}"
-        )
-        sep = (
-            f"{'-' * idx_w}  {'-' * name_w}  "
-            f"{'-' * elo_w}  {'-' * kd_w}  {'-' * adr_w}  {'-' * ranking_w}"
-        )
+        if extended:
+            header = (
+                f"{'Player':<{name_w}} "
+                f"{'ELO':>{elo_w}} {'K/D':>{kd_w}} {'ADR':>{adr_w}} "
+                f"{'FR':>{rating_w}} {'NA':>{ranking_w}}"
+            )
+            sep = (
+                f"{'-' * name_w} "
+                f"{'-' * elo_w} {'-' * kd_w} {'-' * adr_w} "
+                f"{'-' * rating_w} {'-' * ranking_w}"
+            )
+        else:
+            header = (
+                f"{'Player':<{name_w}} "
+                f"{'ELO':>{elo_w}} {'FR':>{rating_w}} {'ADR':>{adr_w}} "
+                f"{'NA':>{ranking_w}}"
+            )
+            sep = (
+                f"{'-' * name_w} "
+                f"{'-' * elo_w} {'-' * rating_w} {'-' * adr_w} "
+                f"{'-' * ranking_w}"
+            )
 
         lines = [header, sep]
-        for i, r in enumerate(rows, 1):
-            lines.append(
-                f"{i:>{idx_w}}  {r['name']:<{name_w}}  "
-                f"{_fmt_int(r['elo']):>{elo_w}}  {_fmt_fixed(r['kd']):>{kd_w}}  "
-                f"{_fmt_fixed(r['adr']):>{adr_w}}  {_fmt_int(r['ranking']):>{ranking_w}}"
-            )
+        for r in rows:
+            name_text = _clip_text(r["name"], name_w)
+            rating_text = _fmt_rating(r["rating"], r["rating_t"], r["rating_ct"], extended=bool(extended))
+            if extended:
+                lines.append(
+                    f"{name_text:<{name_w}} "
+                    f"{_fmt_int(r['elo']):>{elo_w}} {_fmt_fixed(r['kd']):>{kd_w}} "
+                    f"{_fmt_fixed(r['adr'], 1):>{adr_w}} "
+                    f"{rating_text:>{rating_w}} "
+                    f"{_fmt_int(r['ranking']):>{ranking_w}}"
+                )
+            else:
+                lines.append(
+                    f"{name_text:<{name_w}} "
+                    f"{_fmt_int(r['elo']):>{elo_w}} {rating_text:>{rating_w}} "
+                    f"{_fmt_fixed(r['adr'], 1):>{adr_w}} {_fmt_int(r['ranking']):>{ranking_w}}"
+                )
 
         links = [f"[{r['name']}]({r['url']})" for r in rows if r.get("url")]
 
