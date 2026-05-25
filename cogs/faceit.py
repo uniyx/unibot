@@ -510,7 +510,7 @@ class FaceitStats(commands.Cog):
             header = (
                 f"{'Player':<{name_w}} "
                 f"{'ELO':>{elo_w}} {'K/D':>{kd_w}} {'ADR':>{adr_w}} "
-                f"{'FR':>{rating_w}} {'NA':>{ranking_w}}"
+                f"{'FR/T/CT':>{rating_w}} {'NA':>{ranking_w}}"
             )
             sep = (
                 f"{'-' * name_w} "
