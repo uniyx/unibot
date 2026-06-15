@@ -1,20 +1,35 @@
 # cogs/basic.py
-import os
 import random
+from html.parser import HTMLParser
+from urllib.parse import unquote, urljoin, urlsplit
+
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
-from typing import List
 
 from core.discord_utils import guilds_decorator
 
 
 GUILDS = guilds_decorator()
 
-# Directory containing images
-BASE_DIR = "/unibot"
-IMG_DIR = os.path.join(BASE_DIR, "img")
+IMG_BASE_URL = "https://files.uniyx.net/assets/img/"
 ALLOWED_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp"}
+
+
+class ImageLinkParser(HTMLParser):
+    def __init__(self) -> None:
+        super().__init__()
+        self.links: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag.lower() != "a":
+            return
+
+        href = dict(attrs).get("href")
+        if href:
+            self.links.append(href)
+
 
 class Basic(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -51,51 +66,40 @@ class Basic(commands.Cog):
         await interaction.response.send_message(f"{spec} → {rolls} = **{sum(rolls)}**")
 
     @GUILDS
-    @app_commands.command(name="img", description="Send a random image from the shared drive")
+    @app_commands.command(name="img", description="Send a random hosted image")
     async def img(self, interaction: discord.Interaction) -> None:
-        # Immediately acknowledge so Discord doesn't think we stalled
         await interaction.response.defer()
 
-        # 1. Verify directory exists
-        if not os.path.isdir(IMG_DIR):
-            await interaction.followup.send(
-                f"Image directory not found: {IMG_DIR}", ephemeral=True
-            )
-            return
-
-        # 2. Collect all allowed image files
-        all_files: List[str] = []
-        for entry in os.listdir(IMG_DIR):
-            full_path = os.path.join(IMG_DIR, entry)
-            # skip subdirs and weird stuff
-            if not os.path.isfile(full_path):
-                continue
-            _, ext = os.path.splitext(entry)
-            if ext.lower() in ALLOWED_EXTENSIONS:
-                all_files.append(full_path)
-
-        if not all_files:
-            await interaction.followup.send(
-                "No valid images found in the directory.", ephemeral=True
-            )
-            return
-
-        # 3. Pick a random file
-        chosen_path = random.choice(all_files)
-
-        # 4. Send it as an attachment
         try:
-            file = discord.File(chosen_path)
-            filename_only = os.path.basename(chosen_path)
+            timeout = aiohttp.ClientTimeout(total=15)
+            headers = {"User-Agent": "uniyx-discord-bot/1.0"}
+            async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+                async with session.get(IMG_BASE_URL) as response:
+                    response.raise_for_status()
+                    directory_html = await response.text()
+        except (aiohttp.ClientError, TimeoutError) as exc:
             await interaction.followup.send(
-                content=f"Random image: {filename_only}",
-                file=file,
+                f"Failed to load the image directory: {exc}", ephemeral=True
             )
-        except Exception as e:
-            # Failsafe in case of perms / locking / etc.
+            return
+
+        parser = ImageLinkParser()
+        parser.feed(directory_html)
+
+        image_urls = []
+        for href in parser.links:
+            path = unquote(urlsplit(href).path)
+            extension = path.rsplit(".", 1)[-1].lower() if "." in path else ""
+            if f".{extension}" in ALLOWED_EXTENSIONS:
+                image_urls.append(urljoin(IMG_BASE_URL, href))
+
+        if not image_urls:
             await interaction.followup.send(
-                f"Failed to send image: {e}", ephemeral=True
+                "No valid images found in the hosted directory.", ephemeral=True
             )
+            return
+
+        await interaction.followup.send(random.choice(image_urls))
 
 async def setup(bot: commands.Bot):
     await bot.add_cog(Basic(bot))
