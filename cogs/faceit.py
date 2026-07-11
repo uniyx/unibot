@@ -1,6 +1,7 @@
 # cogs/faceit.py
 import os
 import asyncio
+import json
 from statistics import mean
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
@@ -95,6 +96,10 @@ class ApiCounter:
 # -----------------------
 # FACEIT API
 # -----------------------
+class FaceitRatingsUnavailable(RuntimeError):
+    """The private faceit.com statistics endpoint is unavailable."""
+
+
 class FaceitAPI:
     def __init__(self, session: aiohttp.ClientSession, api_key: str, *, concurrency: int = 5):
         self.session = session
@@ -102,6 +107,13 @@ class FaceitAPI:
 
         self.counter = ApiCounter()
         self.sem = asyncio.Semaphore(max(1, int(concurrency)))
+
+        # statistics/v1 is the rate-limited endpoint used by faceit.com itself,
+        # not the Data API. Keep these calls out of the general request burst.
+        self._public_lock = asyncio.Lock()
+        self._public_next_request = 0.0
+        self._public_request_interval = 1.1
+        self._public_unavailable = False
 
         # Per-command in-memory caches
         self._cache_resolve: Dict[str, Tuple[str, str, Optional[int], Optional[str], Optional[str]]] = {}
@@ -154,7 +166,7 @@ class FaceitAPI:
         retries: int = 3,
         label: str = "unknown",
     ) -> dict:
-        backoff = 0.75
+        backoff = 1.5
         headers = {
             "Accept": "application/json",
             "Referer": "https://www.faceit.com/",
@@ -162,10 +174,20 @@ class FaceitAPI:
         }
 
         for attempt in range(retries):
-            async with self.sem:
+            async with self._public_lock:
+                if self._public_unavailable:
+                    raise FaceitRatingsUnavailable(
+                        "FACEIT rating data is temporarily unavailable"
+                    )
+
+                loop = asyncio.get_running_loop()
+                delay = self._public_next_request - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
                 self.counter.inc(label)
 
-                def fetch() -> dict:
+                def fetch():
                     response = curl_requests.get(
                         url,
                         params=params,
@@ -173,19 +195,52 @@ class FaceitAPI:
                         impersonate="chrome136",
                         timeout=30,
                     )
-                    if response.status_code >= 400:
-                        raise RuntimeError(
-                            f"FACEIT GET {url} failed [{response.status_code}]: {response.text[:200]}"
-                        )
-                    return response.json()
+                    return response.status_code, dict(response.headers), response.text
 
                 try:
-                    return await asyncio.to_thread(fetch)
+                    status, response_headers, response_text = await asyncio.to_thread(fetch)
                 except Exception:
+                    self._public_next_request = loop.time() + backoff
                     if attempt >= retries - 1:
                         raise
+                    backoff *= 2
+                    continue
+                self._public_next_request = loop.time() + self._public_request_interval
 
-            await asyncio.sleep(backoff)
+                if status < 400:
+                    try:
+                        return json.loads(response_text)
+                    except Exception as e:
+                        raise RuntimeError(f"FACEIT GET {url} returned invalid JSON") from e
+
+                # Cloudflare challenge pages cannot be solved with a Data API
+                # token. Stop the queued roster requests after the first block.
+                is_cloudflare_block = status == 403 and (
+                    "Just a moment" in response_text
+                    or "cf-mitigated" in response_headers
+                    or "cloudflare" in response_text.lower()
+                )
+                if is_cloudflare_block:
+                    self._public_unavailable = True
+                    raise FaceitRatingsUnavailable(
+                        "FACEIT rating data is temporarily unavailable (website access blocked)"
+                    )
+
+                if status == 429 and attempt < retries - 1:
+                    retry_after = response_headers.get("Retry-After") or response_headers.get("retry-after")
+                    try:
+                        wait = float(retry_after) if retry_after else backoff
+                    except (TypeError, ValueError):
+                        wait = backoff
+                    self._public_next_request = max(
+                        self._public_next_request,
+                        loop.time() + max(wait, backoff),
+                    )
+                else:
+                    detail = response_text[:200].strip()
+                    suffix = f": {detail}" if detail else ""
+                    raise RuntimeError(f"FACEIT GET {url} failed [{status}]{suffix}")
+
             backoff *= 2
 
         raise RuntimeError("Exhausted retries to FACEIT public API")
@@ -454,7 +509,12 @@ class FaceitStats(commands.Cog):
                         rating_ct_val = ratings.get("faceit_rating_ct")
                         rating_matches = int(ratings.get("matches_count") or 0)
                     except Exception as e:
-                        errors.append(f"{name}: failed recent FACEIT rating lookup ({e})")
+                        if isinstance(e, FaceitRatingsUnavailable):
+                            note = str(e)
+                            if note not in errors:
+                                errors.append(note)
+                        else:
+                            errors.append(f"{name}: failed recent FACEIT rating lookup ({e})")
                 else:
                     life = await api.get_lifetime_stats(pid)
                     kd_val = _num_or_none(api.pick_key(life, KD_KEYS))
