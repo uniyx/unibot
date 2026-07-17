@@ -21,7 +21,7 @@ from core.sqlite_utils import connect_sqlite
 
 OUTPUT_TZ       = "America/New_York"
 TEAM_ID         = "15c9a36f-8169-49eb-a41b-0a0e7567ed37"      # crescent
-CHAMPIONSHIP_ID = "840b4960-f24c-4d79-8fad-3fe551683034"      # S57 NA Main Central - Regular Season
+CHAMPIONSHIP_ID = "33c94aa7-6909-4b03-a8d8-cac136e7274e"      # S58 NA Main B - Regular Season
 
 FACEIT_PUBLIC_V1  = "https://www.faceit.com/api"
 FACEIT_ROOM_BASE  = "https://www.faceit.com/en/cs2/room"

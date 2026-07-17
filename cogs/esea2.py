@@ -15,8 +15,10 @@ from core.discord_utils import guilds_decorator
 # =========================
 OUTPUT_TZ       = "America/New_York"
 TEAM_ID         = "15c9a36f-8169-49eb-a41b-0a0e7567ed37"      # crescent
-CHAMPIONSHIP_ID = "840b4960-f24c-4d79-8fad-3fe551683034"      # ESEA S57 NA Main Central
-DIVISION_ID     = "a4ec16e0-348c-455c-aaf3-96711737c397"      # division used by placements API
+CHAMPIONSHIP_ID = "33c94aa7-6909-4b03-a8d8-cac136e7274e"      # ESEA S58 NA Main B - Regular Season
+# FACEIT's S58 championship/match payloads do not expose the placements API's
+# separate division ID. Keep placement disabled instead of showing S57 standings.
+DIVISION_ID     = ""
 
 # =========================
 # ENDPOINTS
@@ -359,19 +361,20 @@ class EseaStats(commands.Cog):
 
         # 1b) placement from division endpoint
         placement_tag = ""
-        try:
-            placement_info = await _fetch_division_placement(self.session, DIVISION_ID, TEAM_ID)
-            if placement_info:
-                placement_val = placement_info.get("placement", 0)
-                won_api = placement_info.get("won", None)
-                lost_api = placement_info.get("lost", None)
-                # Prefer API W/L if present and sensible
-                if isinstance(won_api, int) and isinstance(lost_api, int) and (won_api + lost_api) >= (crescent_w + crescent_l):
-                    crescent_w, crescent_l = won_api, lost_api
-                if placement_val:
-                    placement_tag = f"#{placement_val}"
-        except Exception:
-            placement_tag = ""
+        if DIVISION_ID:
+            try:
+                placement_info = await _fetch_division_placement(self.session, DIVISION_ID, TEAM_ID)
+                if placement_info:
+                    placement_val = placement_info.get("placement", 0)
+                    won_api = placement_info.get("won", None)
+                    lost_api = placement_info.get("lost", None)
+                    # Prefer API W/L if present and sensible
+                    if isinstance(won_api, int) and isinstance(lost_api, int) and (won_api + lost_api) >= (crescent_w + crescent_l):
+                        crescent_w, crescent_l = won_api, lost_api
+                    if placement_val:
+                        placement_tag = f"#{placement_val}"
+            except Exception:
+                placement_tag = ""
 
         def build_title(w: int, l: int, placement_txt: str) -> str:
             parts: List[str] = []
