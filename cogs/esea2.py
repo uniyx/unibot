@@ -9,6 +9,7 @@ import aiohttp
 
 from core.config import env_str
 from core.discord_utils import guilds_decorator
+from cogs.faceit import FaceitAPI, FaceitRatingsUnavailable
 
 # =========================
 # FIXED IDS (ESEA Main • crescent)
@@ -269,7 +270,9 @@ def _render_table(agg: Dict[str, Dict[str, Any]]) -> str:
         adr_str = f"{r['adr_overall']:.2f}"
         hs_str  = f"{r['hs_pct_overall']:.2f}"
         kpr_str = f"{r['kpr_overall']:.3f}"
-        formatted_rows.append((r, kd_str, adr_str, hs_str, kpr_str))
+        rating = r.get("faceit_rating")
+        fr_str = f"{rating:.2f}" if isinstance(rating, (int, float)) else "n/a"
+        formatted_rows.append((r, kd_str, adr_str, hs_str, kpr_str, fr_str))
 
     name_w = max(5, max((len(r["nickname"]) for r in rows), default=5))
     mp_w   = max(2, len("MP"))
@@ -277,6 +280,7 @@ def _render_table(agg: Dict[str, Dict[str, Any]]) -> str:
     adr_w  = max(5, len("ADR"), *(len(fr[2]) for fr in formatted_rows) or [5])
     hs_w   = max(4, len("HS%"), *(len(fr[3]) for fr in formatted_rows) or [4])
     kpr_w  = max(3, len("KPR"), *(len(fr[4]) for fr in formatted_rows) or [3])
+    fr_w   = max(2, len("FR"), *(len(fr[5]) for fr in formatted_rows) or [2])
     rnd_w  = max(4, len("Rnds"))
 
     header = (
@@ -286,6 +290,7 @@ def _render_table(agg: Dict[str, Dict[str, Any]]) -> str:
         f"{'ADR':>{adr_w}}  "
         f"{'HS%':>{hs_w}}  "
         f"{'KPR':>{kpr_w}}  "
+        f"{'FR':>{fr_w}}  "
         f"{'Rnds':>{rnd_w}}"
     )
     sep = (
@@ -295,11 +300,12 @@ def _render_table(agg: Dict[str, Dict[str, Any]]) -> str:
         f"{'-'*adr_w}  "
         f"{'-'*hs_w}  "
         f"{'-'*kpr_w}  "
+        f"{'-'*fr_w}  "
         f"{'-'*rnd_w}"
     )
 
     lines = [header, sep]
-    for r, kd_str, adr_str, hs_str, kpr_str in formatted_rows:
+    for r, kd_str, adr_str, hs_str, kpr_str, fr_str in formatted_rows:
         lines.append(
             f"{r['nickname']:<{name_w}}  "
             f"{r['matches_played']:>{mp_w}}  "
@@ -307,6 +313,7 @@ def _render_table(agg: Dict[str, Dict[str, Any]]) -> str:
             f"{adr_str:>{adr_w}}  "
             f"{hs_str:>{hs_w}}  "
             f"{kpr_str:>{kpr_w}}  "
+            f"{fr_str:>{fr_w}}  "
             f"{r['rounds']:>{rnd_w}}"
         )
 
@@ -417,13 +424,26 @@ class EseaStats(commands.Cog):
             await interaction.followup.send(embed=embed)
             return
 
+        # FACEIT Rating uses the same recent-30 scope and endpoint as /faceit.
+        # The rating response does not provide usable ESEA room IDs for an
+        # exact season-only filter, so keep its scope explicit in the footer.
+        ratings_api = FaceitAPI(self.session, env_str("FACEIT_API_KEY"))
+        for player_id, player_totals in totals.items():
+            try:
+                ratings = await ratings_api.get_recent_ratings_batch(player_id, limit=30)
+                player_totals["faceit_rating"] = ratings.get("faceit_rating")
+            except FaceitRatingsUnavailable:
+                break
+            except Exception:
+                continue
+
         table = _render_table(totals)
         embed = discord.Embed(
             title=build_title(crescent_w, crescent_l, placement_tag),
             description=table,
             color=THEME_COLOR
         )
-        embed.set_footer(text="Source: FACEIT Data API (ESEA season only)")
+        embed.set_footer(text="Source: FACEIT • ESEA stats: season only • FR: up to 30 recent matches")
         await interaction.followup.send(embed=embed)
 
 
