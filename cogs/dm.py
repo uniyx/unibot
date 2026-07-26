@@ -193,14 +193,21 @@ def format_table_pretty(rows: List[Tuple[str, int, int, int]], server_count: int
         f"Servers: **{server_count}** • Goal: **{MONTHLY_GOAL_KILLS}** • Target/day: **{DAILY_TARGET_KILLS}** • "
         f"{now.strftime('%a %b %d, %Y %H:%M %Z')}\n\n"
     )
-    title_line = f"{'Player':{name_w}}  {'Kills':>6}  {'%':>3}  {'Δ':>5}  {'Progress':<{16}}"
+    # Include the sign when sizing the delta values so four-digit deficits do
+    # not push their progress bars one character out of alignment.
+    delta_value_w = max(4, max((len(f"{row[3]:+d}") for row in rows), default=0))
+    delta_col_w = delta_value_w + 1  # one character for the status emoji
+    title_line = f"{'Player':{name_w}}  {'Kills':>6}  {'%':>3}  {'Δ':>{delta_col_w}}  {'Progress':<{16}}"
     sep_line = "-" * len(title_line)
     lines = [title_line, sep_line]
     for name, kills, pct_done, delta in rows:
         medal = label_to_medal.get(name, "🏁")
         delta_mark = _delta_emoji(delta)
         bar = _progress_bar(kills, MONTHLY_GOAL_KILLS, width=16)
-        lines.append(f"{medal} {name:{name_w}}  {kills:6d}  {pct_done:3d}  {delta_mark}{delta:+4d}  {bar}")
+        lines.append(
+            f"{medal} {name:{name_w}}  {kills:6d}  {pct_done:3d}  "
+            f"{delta_mark}{delta:<+{delta_value_w}d}  {bar}"
+        )
     return "```\n" + "\n".join(lines) + "\n```"
 
 # =========================
@@ -264,7 +271,13 @@ class dm(commands.Cog):
             description=format_table_pretty(table_rows, server_count=len(SERVERS), now=now),
             color=EMBED_COLOR,
         )
-        embed.set_footer(text=f"Server {SERVERS} • Region {REGION} • {now.strftime('%a %b %d, %Y %H:%M %Z')}")
+        embed.set_footer(
+            text=(
+                "Stats updated on WASM server restarts • "
+                f"Servers: {', '.join(SERVERS)} • Region: {REGION} • "
+                f"{now.strftime('%a %b %d, %Y %H:%M %Z')}"
+            )
+        )
         await interaction.followup.send(embed=embed)
 
 async def setup(bot: commands.Bot):
