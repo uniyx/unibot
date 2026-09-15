@@ -8,7 +8,6 @@ from aiohttp import web
 from discord.ext import commands
 
 from core.config import env_optional_int, env_str
-from core.discord_utils import slash_only_prefix
 
 
 TOKEN = env_str("DISCORD_TOKEN")
@@ -62,7 +61,7 @@ async def start_health_server(host: str = "0.0.0.0", port: int = HEALTH_PORT):
 
 class UniBot(commands.Bot):
     def __init__(self) -> None:
-        super().__init__(command_prefix=slash_only_prefix, intents=intents)
+        super().__init__(command_prefix=[], intents=intents)
         self.initial_extensions = [
             "cogs.basic",
             "cogs.status",
@@ -78,14 +77,6 @@ class UniBot(commands.Bot):
             "cogs.cam",
             "cogs.inv",
         ]
-
-    # Belt and suspenders. Even if something calls process_commands, this never returns None.
-    async def get_prefix(self, _message: discord.Message):
-        return []
-
-    # Slash only. Do not process message commands.
-    async def on_message(self, _message: discord.Message) -> None:
-        return
 
     async def setup_hook(self) -> None:
         # Load cogs with error reporting

@@ -1,6 +1,5 @@
 # cogs/status.py
 import os
-import sys
 import time
 import platform
 import asyncio
@@ -20,12 +19,6 @@ try:
     import psutil  # type: ignore
 except Exception:
     psutil = None
-
-try:
-    import docker  # type: ignore
-except Exception:
-    docker = None
-
 
 # ---- helpers ---------------------------------------------------------------
 
@@ -89,8 +82,6 @@ class StatusCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
         self.bot_started = time.monotonic()
-        self._last_net_bytes: Optional[Tuple[int, int]] = None
-        self._last_net_ts: Optional[float] = None
         self._nic_last: Dict[str, Tuple[int, int, float]] = {}
 
     @guilds_decorator()
@@ -241,17 +232,6 @@ class StatusCog(commands.Cog):
                 embed.add_field(name="Top Memory", value=fmt(top_mem)[:1024], inline=True)
             except Exception:
                 pass
-
-            # Next row: Docker brief
-            if docker:
-                try:
-                    client = docker.from_env()
-                    containers = client.containers.list(all=True)
-                    brief = [f"`{c.name}` [{c.status}]" for c in containers[:12]]
-                    if brief:
-                        embed.add_field(name="Docker", value="\n".join(brief), inline=False)
-                except Exception:
-                    pass
 
         # Footer
         rt_ms = int((time.perf_counter() - t0) * 1000)

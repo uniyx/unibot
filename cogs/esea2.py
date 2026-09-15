@@ -1,6 +1,5 @@
 # cogs/esea2.py
-import os
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 import discord
 from discord import app_commands
@@ -10,21 +9,17 @@ import aiohttp
 from core.config import env_str
 from core.discord_utils import guilds_decorator
 from cogs.faceit import FaceitAPI, FaceitRatingsUnavailable
+from cogs.esea import FaceitV1Client, compute_record_from_fixtures
 
 # =========================
 # FIXED IDS (ESEA Main • crescent)
 # =========================
-OUTPUT_TZ       = "America/New_York"
 TEAM_ID         = "15c9a36f-8169-49eb-a41b-0a0e7567ed37"      # crescent
 CHAMPIONSHIP_ID = "33c94aa7-6909-4b03-a8d8-cac136e7274e"      # ESEA S58 NA Main B - Regular Season
-# FACEIT's S58 championship/match payloads do not expose the placements API's
-# separate division ID. Keep placement disabled instead of showing S57 standings.
-DIVISION_ID     = ""
 
 # =========================
 # ENDPOINTS
 # =========================
-V1_BASE = "https://www.faceit.com/api"
 V4_BASE = "https://open.faceit.com/data/v4"
 
 # =========================
@@ -37,7 +32,6 @@ TITLE_BASE  = "crescent <:crescent:855175620891508736>"
 # CONSTANTS
 # =========================
 REQUEST_TIMEOUT = 20.0
-PAGE_LIMIT_V1   = 70
 
 # =========================
 # HELPERS
@@ -64,96 +58,11 @@ def _to_float(x: Any) -> float:
     except Exception:
         return 0.0
 
-def _v1_headers() -> Dict[str, str]:
-    return {"Accept": "application/json"}
-
 def _v4_headers() -> Dict[str, str]:
     api_key = env_str("FACEIT_API_KEY")
     if not api_key:
         raise RuntimeError("FACEIT_API_KEY is required for v4 stats calls.")
     return {"Accept": "application/json", "Authorization": f"Bearer {api_key}"}
-
-# ---------------- Public v1 fixtures (finished only) ----------------
-async def _fetch_finished_fixtures(session: aiohttp.ClientSession, team_id: str, champ_id: str) -> List[Dict[str, Any]]:
-    items: List[Dict[str, Any]] = []
-    offset = 0
-    while True:
-        params = {
-            "participantId": team_id,
-            "participantType": "TEAM",
-            "championshipId": champ_id,
-            "limit": str(PAGE_LIMIT_V1),
-            "offset": str(offset),
-            "sort": "ASC",
-        }
-        url = f"{V1_BASE}/championships/v1/matches"
-        async with session.get(url, params=params, headers=_v1_headers(), timeout=REQUEST_TIMEOUT) as resp:
-            if resp.status == 404:
-                break
-            if resp.status != 200:
-                text = await resp.text()
-                raise RuntimeError(f"fixtures HTTP {resp.status}: {text[:200]}")
-            data = await resp.json()
-            page = (data.get("payload") or {}).get("items") or []
-            if not page:
-                break
-            items.extend([x for x in page if str(x.get("status", "")).lower() == "finished"])
-            if len(page) < PAGE_LIMIT_V1:
-                break
-            offset += PAGE_LIMIT_V1
-
-    items.sort(key=lambda m: (m.get("origin", {}).get("schedule", 0)))
-    return items
-
-def _compute_record_from_fixtures(fixtures: List[Dict[str, Any]], team_id: str) -> Tuple[int, int]:
-    w = l = 0
-    for m in fixtures:
-        winner = str(m.get("winner") or "")
-        if not winner:
-            continue
-        if winner == team_id:
-            w += 1
-        else:
-            l += 1
-    return w, l
-
-# ---------------- Placements (public v1) ----------------
-async def _fetch_division_placement(
-    session: aiohttp.ClientSession,
-    division_id: str,
-    premade_team_id: str,
-) -> Optional[Dict[str, Any]]:
-    """
-    Reads https://www.faceit.com/api/team-leagues/v1/placements?divisionId=...
-    Expected shape:
-      { "payload": { "placements": [ { placement, won, lost, points, buchholz, teams: [ { premade_team_id, ... } ] }, ... ] } }
-
-    Returns a dict with placement, won, lost, points, buchholz for the entry whose teams[].premade_team_id == premade_team_id.
-    Falls back to None if not found.
-    """
-    url = f"{V1_BASE}/team-leagues/v1/placements"
-    params = {"divisionId": division_id}
-    async with session.get(url, params=params, headers=_v1_headers(), timeout=REQUEST_TIMEOUT) as resp:
-        if resp.status != 200:
-            return None
-        data = await resp.json()
-
-    placements = (((data or {}).get("payload") or {}).get("placements") or [])
-    if not isinstance(placements, list):
-        return None
-
-    for e in placements:
-        for t in (e.get("teams") or []):
-            if str(t.get("premade_team_id")) == str(premade_team_id):
-                return {
-                    "placement": _to_int(e.get("placement")),
-                    "won": _to_int(e.get("won")),
-                    "lost": _to_int(e.get("lost")),
-                    "points": _to_int(e.get("points")),
-                    "buchholz": _to_int(e.get("buchholz")),
-                }
-    return None
-
 
 # ---------------- Open v4 match stats ----------------
 async def _fetch_match_stats(session: aiohttp.ClientSession, match_id: str) -> Dict[str, Any]:
@@ -359,41 +268,25 @@ class EseaStats(commands.Cog):
 
         # 1) finished fixtures for record and match ids
         try:
-            fixtures = await _fetch_finished_fixtures(self.session, TEAM_ID, CHAMPIONSHIP_ID)
+            fixtures_api = FaceitV1Client(self.session)
+            fixtures = await fixtures_api.fetch_team_fixtures(
+                TEAM_ID,
+                CHAMPIONSHIP_ID,
+                finished_only=True,
+            )
         except Exception as e:
             await interaction.followup.send(f"Error fetching fixtures: {e}", ephemeral=True)
             return
 
-        crescent_w, crescent_l = _compute_record_from_fixtures(fixtures, TEAM_ID)
+        crescent_w, crescent_l = compute_record_from_fixtures(fixtures, TEAM_ID)
 
-        # 1b) placement from division endpoint
-        placement_tag = ""
-        if DIVISION_ID:
-            try:
-                placement_info = await _fetch_division_placement(self.session, DIVISION_ID, TEAM_ID)
-                if placement_info:
-                    placement_val = placement_info.get("placement", 0)
-                    won_api = placement_info.get("won", None)
-                    lost_api = placement_info.get("lost", None)
-                    # Prefer API W/L if present and sensible
-                    if isinstance(won_api, int) and isinstance(lost_api, int) and (won_api + lost_api) >= (crescent_w + crescent_l):
-                        crescent_w, crescent_l = won_api, lost_api
-                    if placement_val:
-                        placement_tag = f"#{placement_val}"
-            except Exception:
-                placement_tag = ""
-
-        def build_title(w: int, l: int, placement_txt: str) -> str:
-            parts: List[str] = []
-            if placement_txt:
-                parts.append(placement_txt)
-            parts.append(f"{w}W - {l}L")
-            inside = " • ".join(parts)
+        def build_title(w: int, l: int) -> str:
+            inside = f"{w}W - {l}L"
             return f"{TITLE_BASE} ({inside}) • ESEA Main stats"
 
         if not fixtures:
             embed = discord.Embed(
-                title=build_title(crescent_w, crescent_l, placement_tag),
+                title=build_title(crescent_w, crescent_l),
                 description="No finished matches found for this season.",
                 color=THEME_COLOR,
             )
@@ -417,7 +310,7 @@ class EseaStats(commands.Cog):
         totals = _aggregate_totals(per_match)
         if not totals:
             embed = discord.Embed(
-                title=build_title(crescent_w, crescent_l, placement_tag),
+                title=build_title(crescent_w, crescent_l),
                 description="No season stats available yet.",
                 color=THEME_COLOR,
             )
@@ -439,7 +332,7 @@ class EseaStats(commands.Cog):
 
         table = _render_table(totals)
         embed = discord.Embed(
-            title=build_title(crescent_w, crescent_l, placement_tag),
+            title=build_title(crescent_w, crescent_l),
             description=table,
             color=THEME_COLOR
         )

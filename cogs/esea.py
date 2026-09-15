@@ -1,5 +1,4 @@
 # cogs/esea.py
-import os
 import asyncio
 import sqlite3
 import datetime as dt
@@ -244,6 +243,24 @@ def _gc_stale(conn: sqlite3.Connection) -> None:
 # FACEIT CLIENT (Public v1 only)
 # =========================
 
+def compute_record_from_fixtures(
+    fixtures: List[Dict[str, Any]],
+    team_id: str,
+) -> Tuple[int, int]:
+    wins = losses = 0
+    for match in fixtures:
+        if str(match.get("status", "")).lower() != "finished":
+            continue
+        winner = str(match.get("winner") or "")
+        if not winner:
+            continue
+        if winner == team_id:
+            wins += 1
+        else:
+            losses += 1
+    return wins, losses
+
+
 class FaceitV1Client:
     def __init__(self, session: aiohttp.ClientSession):
         self.session = session
@@ -292,7 +309,13 @@ class FaceitV1Client:
 
         return items
 
-    async def fetch_team_fixtures(self, team_id: str, champ_id: str) -> List[Dict[str, Any]]:
+    async def fetch_team_fixtures(
+        self,
+        team_id: str,
+        champ_id: str,
+        *,
+        finished_only: bool = False,
+    ) -> List[Dict[str, Any]]:
         items = await self._fetch_paged_items(
             f"{FACEIT_PUBLIC_V1}/championships/v1/matches",
             params={
@@ -304,6 +327,12 @@ class FaceitV1Client:
             limit=70,
             payload_path="payload.items",
         )
+        if finished_only:
+            items = [
+                item
+                for item in items
+                if str(item.get("status", "")).lower() == "finished"
+            ]
         items.sort(key=lambda m: (m.get("origin", {}).get("schedule", 0)))
         return items
 
@@ -332,18 +361,7 @@ class FaceitV1Client:
 
     async def compute_record(self, team_id: str, champ_id: str) -> Tuple[int, int]:
         fixtures = await self.fetch_team_fixtures(team_id, champ_id)
-        wins = losses = 0
-        for m in fixtures:
-            if str(m.get("status", "")).lower() != "finished":
-                continue
-            winner = str(m.get("winner") or "")
-            if not winner:
-                continue
-            if winner == team_id:
-                wins += 1
-            else:
-                losses += 1
-        return wins, losses
+        return compute_record_from_fixtures(fixtures, team_id)
 
     async def upcoming_scheduled(self, team_id: str, champ_id: str) -> List[Dict[str, Any]]:
         items = await self._fetch_paged_items(

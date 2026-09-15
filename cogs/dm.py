@@ -1,6 +1,5 @@
 # cogs/dm.py
 import json
-import os
 import asyncio
 import re
 from typing import Dict, List, Optional, Tuple

@@ -1,7 +1,7 @@
 # cogs/faceit.py
-import os
 import asyncio
 import json
+from html import unescape
 from statistics import mean
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
@@ -18,6 +18,7 @@ from core.faceit_utils import FACEIT_BASE_V4
 
 FACEIT_BASE = FACEIT_BASE_V4
 FACEIT_STATS_BASE = "https://www.faceit.com/api/statistics/v1"
+RATINGS_UNAVAILABLE_NOTE = "FACEIT Rating is unavailable; other Data API stats are still shown."
 
 KD_KEYS = ["Average K/D Ratio", "K/D Ratio", "K/D"]
 ADR_KEYS = ["Average Damage/Round", "ADR", "Average Damage per Round"]
@@ -72,6 +73,54 @@ def _safe_url(u: Optional[str]) -> Optional[str]:
     if not u:
         return None
     return u.replace("{lang}", "en").rstrip("/")
+
+
+def _append_unique_note(notes: List[str], value: Any) -> None:
+    note = unescape(str(value or "")).strip()
+    if note and note not in notes:
+        notes.append(note)
+
+
+def _extract_recent_ratings(data: Dict[str, Any], limit: int) -> Dict[str, Any]:
+    """Read both the current camel-case and legacy snake-case FACEIT payloads."""
+    payload = data.get("payload") or {}
+    rounds: Any = None
+
+    if isinstance(payload, dict):
+        game_stats = payload.get("gameStats") or payload.get("game_stats") or {}
+        if isinstance(game_stats, dict):
+            game_stats_value = game_stats.get("value") or {}
+            if isinstance(game_stats_value, dict):
+                rounds = game_stats_value.get("matchRounds")
+                if rounds is None:
+                    rounds = game_stats_value.get("match_rounds")
+
+        if rounds is None:
+            cs2_payload = payload.get("cs2") or {}
+            if isinstance(cs2_payload, dict):
+                rounds = cs2_payload.get("match_rounds")
+                if rounds is None:
+                    rounds = cs2_payload.get("matchRounds")
+
+    if not isinstance(rounds, list):
+        rounds = []
+    rounds = [item for item in rounds[:limit] if isinstance(item, dict)]
+
+    def avg_field(*fields: str) -> Optional[float]:
+        values: List[float] = []
+        for item in rounds:
+            raw_value = next((item[field] for field in fields if field in item), None)
+            value = _num_or_none(raw_value)
+            if value is not None:
+                values.append(value)
+        return mean(values) if values else None
+
+    return {
+        "faceit_rating": avg_field("faceitRating", "faceit_rating"),
+        "faceit_rating_t": avg_field("faceitRatingT", "faceit_rating_t"),
+        "faceit_rating_ct": avg_field("faceitRatingCt", "faceit_rating_ct"),
+        "matches_count": len(rounds),
+    }
 
 # -----------------------
 # API call accounting
@@ -168,7 +217,7 @@ class FaceitAPI:
     ) -> dict:
         backoff = 1.5
         headers = {
-            "Accept": "application/json",
+            "Accept": "application/json+camelcase",
             "Referer": "https://www.faceit.com/",
             "Origin": "https://www.faceit.com",
         }
@@ -176,9 +225,7 @@ class FaceitAPI:
         for attempt in range(retries):
             async with self._public_lock:
                 if self._public_unavailable:
-                    raise FaceitRatingsUnavailable(
-                        "FACEIT rating data is temporarily unavailable"
-                    )
+                    raise FaceitRatingsUnavailable(RATINGS_UNAVAILABLE_NOTE)
 
                 loop = asyncio.get_running_loop()
                 delay = self._public_next_request - loop.time()
@@ -222,9 +269,7 @@ class FaceitAPI:
                 )
                 if is_cloudflare_block:
                     self._public_unavailable = True
-                    raise FaceitRatingsUnavailable(
-                        "FACEIT rating data is temporarily unavailable (website access blocked)"
-                    )
+                    raise FaceitRatingsUnavailable(RATINGS_UNAVAILABLE_NOTE)
 
                 if status == 429 and attempt < retries - 1:
                     retry_after = response_headers.get("Retry-After") or response_headers.get("retry-after")
@@ -342,27 +387,10 @@ class FaceitAPI:
         url = f"{FACEIT_STATS_BASE}/cs2/players/{player_id}/match-rounds"
         data = await self._get_public_json(
             url,
-            params={"limit": limit},
+            params={"gameMode": "5v5", "limit": limit},
             label="statistics.match_rounds",
         )
-        rounds = (
-            data.get("payload", {})
-                .get("cs2", {})
-                .get("match_rounds", [])
-        )
-        rounds = rounds[:limit]
-
-        def avg_field(field: str) -> Optional[float]:
-            values = [_num_or_none(item.get(field)) for item in rounds if isinstance(item, dict)]
-            values = [v for v in values if v is not None]
-            return mean(values) if values else None
-
-        out = {
-            "faceit_rating": avg_field("faceit_rating"),
-            "faceit_rating_t": avg_field("faceit_rating_t"),
-            "faceit_rating_ct": avg_field("faceit_rating_ct"),
-            "matches_count": len(rounds),
-        }
+        out = _extract_recent_ratings(data, limit)
         self._cache_recent_ratings[cache_key] = out
         return out
 
@@ -510,9 +538,7 @@ class FaceitStats(commands.Cog):
                         rating_matches = int(ratings.get("matches_count") or 0)
                     except Exception as e:
                         if isinstance(e, FaceitRatingsUnavailable):
-                            note = str(e)
-                            if note not in errors:
-                                errors.append(note)
+                            _append_unique_note(errors, RATINGS_UNAVAILABLE_NOTE)
                         else:
                             errors.append(f"{name}: failed recent FACEIT rating lookup ({e})")
                 else:
