@@ -321,14 +321,17 @@ class EseaStats(commands.Cog):
         # The rating response does not provide usable ESEA room IDs for an
         # exact season-only filter, so keep its scope explicit in the footer.
         ratings_api = FaceitAPI(self.session, env_str("FACEIT_API_KEY"))
-        for player_id, player_totals in totals.items():
-            try:
-                ratings = await ratings_api.get_recent_ratings_batch(player_id, limit=30)
-                player_totals["faceit_rating"] = ratings.get("faceit_rating")
-            except FaceitRatingsUnavailable:
-                break
-            except Exception:
-                continue
+        try:
+            for player_id, player_totals in totals.items():
+                try:
+                    ratings = await ratings_api.get_recent_ratings_batch(player_id, limit=30)
+                    player_totals["faceit_rating"] = ratings.get("faceit_rating")
+                except FaceitRatingsUnavailable:
+                    break
+                except Exception:
+                    continue
+        finally:
+            await ratings_api.close()
 
         table = _render_table(totals)
         embed = discord.Embed(

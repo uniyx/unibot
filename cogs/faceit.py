@@ -1,10 +1,12 @@
 # cogs/faceit.py
 import asyncio
 import json
+from contextlib import suppress
 from html import unescape
 from statistics import mean
 from typing import Dict, List, Optional, Tuple, Any
 from collections import defaultdict
+from urllib.parse import urlencode
 
 import aiohttp
 import discord
@@ -19,6 +21,22 @@ from core.faceit_utils import FACEIT_BASE_V4
 FACEIT_BASE = FACEIT_BASE_V4
 FACEIT_STATS_BASE = "https://www.faceit.com/api/statistics/v1"
 RATINGS_UNAVAILABLE_NOTE = "FACEIT Rating is unavailable; other Data API stats are still shown."
+
+_BROWSER_FETCH_SCRIPT = """
+async (url) => {
+    const response = await fetch(url, {
+        method: "GET",
+        credentials: "include",
+        headers: {"accept": "application/json+camelcase"}
+    });
+    return {
+        status: response.status,
+        content_type: response.headers.get("content-type"),
+        cf_mitigated: response.headers.get("cf-mitigated"),
+        body: await response.text()
+    };
+}
+"""
 
 KD_KEYS = ["Average K/D Ratio", "K/D Ratio", "K/D"]
 ADR_KEYS = ["Average Damage/Round", "ADR", "Average Damage per Round"]
@@ -163,6 +181,11 @@ class FaceitAPI:
         self._public_next_request = 0.0
         self._public_request_interval = 1.1
         self._public_unavailable = False
+        self._public_browser_only = False
+        self._browser_lock = asyncio.Lock()
+        self._browser = None
+        self._browser_context = None
+        self._browser_page = None
 
         # Per-command in-memory caches
         self._cache_resolve: Dict[str, Tuple[str, str, Optional[int], Optional[str], Optional[str]]] = {}
@@ -170,6 +193,20 @@ class FaceitAPI:
         self._cache_recent_batch: Dict[Tuple[str, int], Dict[str, Any]] = {}
         self._cache_recent_ratings: Dict[Tuple[str, int], Dict[str, Any]] = {}
         self._cache_ranking: Dict[Tuple[str, str, str, Optional[str]], Optional[int]] = {}
+
+    async def close(self) -> None:
+        context = self._browser_context
+        browser = self._browser
+        self._browser_context = None
+        self._browser = None
+        self._browser_page = None
+
+        if context is not None:
+            with suppress(Exception):
+                await context.close()
+        if browser is not None:
+            with suppress(Exception):
+                await browser.close()
 
     async def _get_json(
         self,
@@ -207,6 +244,81 @@ class FaceitAPI:
 
         raise RuntimeError("Exhausted retries to FACEIT API")
 
+    async def _get_browser_json(
+        self,
+        url: str,
+        params: Optional[dict] = None,
+        *,
+        label: str = "unknown",
+    ) -> dict:
+        try:
+            from cloakbrowser import launch_async
+        except ImportError as exc:
+            self._public_unavailable = True
+            raise FaceitRatingsUnavailable(RATINGS_UNAVAILABLE_NOTE) from exc
+
+        query = urlencode(params or {})
+        request_url = f"{url}?{query}" if query else url
+
+        async with self._browser_lock:
+            if self._public_unavailable:
+                raise FaceitRatingsUnavailable(RATINGS_UNAVAILABLE_NOTE)
+
+            try:
+                if self._browser_page is None:
+                    self._browser = await launch_async(headless=True, humanize=False)
+                    self._browser_context = await self._browser.new_context()
+                    self._browser_page = await self._browser_context.new_page()
+                    await self._browser_page.goto(
+                        "https://www.faceit.com/",
+                        wait_until="domcontentloaded",
+                        timeout=60_000,
+                    )
+
+                loop = asyncio.get_running_loop()
+                delay = self._public_next_request - loop.time()
+                if delay > 0:
+                    await asyncio.sleep(delay)
+
+                self.counter.inc(label)
+                result = await self._browser_page.evaluate(
+                    _BROWSER_FETCH_SCRIPT,
+                    request_url,
+                )
+                if not isinstance(result, dict):
+                    raise RuntimeError("FACEIT browser request returned malformed data")
+
+                status = int(result.get("status") or 0)
+                response_text = str(result.get("body") or "")
+                response_headers = {
+                    "cf-mitigated": result.get("cf_mitigated") or "",
+                }
+                self._public_next_request = loop.time() + self._public_request_interval
+            except FaceitRatingsUnavailable:
+                raise
+            except Exception as exc:
+                self._public_unavailable = True
+                raise FaceitRatingsUnavailable(RATINGS_UNAVAILABLE_NOTE) from exc
+
+            if status < 400:
+                try:
+                    return json.loads(response_text)
+                except Exception as exc:
+                    raise RuntimeError(f"FACEIT browser GET {url} returned invalid JSON") from exc
+
+            is_cloudflare_block = status == 403 and (
+                "Just a moment" in response_text
+                or response_headers["cf-mitigated"]
+                or "cloudflare" in response_text.lower()
+            )
+            if is_cloudflare_block:
+                self._public_unavailable = True
+                raise FaceitRatingsUnavailable(RATINGS_UNAVAILABLE_NOTE)
+
+            detail = response_text[:200].strip()
+            suffix = f": {detail}" if detail else ""
+            raise RuntimeError(f"FACEIT browser GET {url} failed [{status}]{suffix}")
+
     async def _get_public_json(
         self,
         url: str,
@@ -223,68 +335,77 @@ class FaceitAPI:
         }
 
         for attempt in range(retries):
+            use_browser = False
             async with self._public_lock:
                 if self._public_unavailable:
                     raise FaceitRatingsUnavailable(RATINGS_UNAVAILABLE_NOTE)
 
-                loop = asyncio.get_running_loop()
-                delay = self._public_next_request - loop.time()
-                if delay > 0:
-                    await asyncio.sleep(delay)
-
-                self.counter.inc(label)
-
-                def fetch():
-                    response = curl_requests.get(
-                        url,
-                        params=params,
-                        headers=headers,
-                        impersonate="chrome136",
-                        timeout=30,
-                    )
-                    return response.status_code, dict(response.headers), response.text
-
-                try:
-                    status, response_headers, response_text = await asyncio.to_thread(fetch)
-                except Exception:
-                    self._public_next_request = loop.time() + backoff
-                    if attempt >= retries - 1:
-                        raise
-                    backoff *= 2
-                    continue
-                self._public_next_request = loop.time() + self._public_request_interval
-
-                if status < 400:
-                    try:
-                        return json.loads(response_text)
-                    except Exception as e:
-                        raise RuntimeError(f"FACEIT GET {url} returned invalid JSON") from e
-
-                # Cloudflare challenge pages cannot be solved with a Data API
-                # token. Stop the queued roster requests after the first block.
-                is_cloudflare_block = status == 403 and (
-                    "Just a moment" in response_text
-                    or "cf-mitigated" in response_headers
-                    or "cloudflare" in response_text.lower()
-                )
-                if is_cloudflare_block:
-                    self._public_unavailable = True
-                    raise FaceitRatingsUnavailable(RATINGS_UNAVAILABLE_NOTE)
-
-                if status == 429 and attempt < retries - 1:
-                    retry_after = response_headers.get("Retry-After") or response_headers.get("retry-after")
-                    try:
-                        wait = float(retry_after) if retry_after else backoff
-                    except (TypeError, ValueError):
-                        wait = backoff
-                    self._public_next_request = max(
-                        self._public_next_request,
-                        loop.time() + max(wait, backoff),
-                    )
+                if self._public_browser_only and url.startswith(FACEIT_STATS_BASE):
+                    use_browser = True
                 else:
-                    detail = response_text[:200].strip()
-                    suffix = f": {detail}" if detail else ""
-                    raise RuntimeError(f"FACEIT GET {url} failed [{status}]{suffix}")
+                    loop = asyncio.get_running_loop()
+                    delay = self._public_next_request - loop.time()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
+
+                    self.counter.inc(label)
+
+                    def fetch():
+                        response = curl_requests.get(
+                            url,
+                            params=params,
+                            headers=headers,
+                            impersonate="chrome136",
+                            timeout=30,
+                        )
+                        return response.status_code, dict(response.headers), response.text
+
+                    try:
+                        status, response_headers, response_text = await asyncio.to_thread(fetch)
+                    except Exception:
+                        self._public_next_request = loop.time() + backoff
+                        if attempt >= retries - 1:
+                            raise
+                        backoff *= 2
+                        continue
+                    self._public_next_request = loop.time() + self._public_request_interval
+
+                    if status < 400:
+                        try:
+                            return json.loads(response_text)
+                        except Exception as e:
+                            raise RuntimeError(f"FACEIT GET {url} returned invalid JSON") from e
+
+                    # Cloudflare challenge pages cannot be solved with a Data API
+                    # token. Try the browser transport for the website rating endpoint.
+                    is_cloudflare_block = status == 403 and (
+                        "Just a moment" in response_text
+                        or "cf-mitigated" in response_headers
+                        or "cloudflare" in response_text.lower()
+                    )
+                    if is_cloudflare_block and url.startswith(FACEIT_STATS_BASE):
+                        self._public_browser_only = True
+                        use_browser = True
+                    elif is_cloudflare_block:
+                        self._public_unavailable = True
+                        raise FaceitRatingsUnavailable(RATINGS_UNAVAILABLE_NOTE)
+                    elif status == 429 and attempt < retries - 1:
+                        retry_after = response_headers.get("Retry-After") or response_headers.get("retry-after")
+                        try:
+                            wait = float(retry_after) if retry_after else backoff
+                        except (TypeError, ValueError):
+                            wait = backoff
+                        self._public_next_request = max(
+                            self._public_next_request,
+                            loop.time() + max(wait, backoff),
+                        )
+                    else:
+                        detail = response_text[:200].strip()
+                        suffix = f": {detail}" if detail else ""
+                        raise RuntimeError(f"FACEIT GET {url} failed [{status}]{suffix}")
+
+            if use_browser:
+                return await self._get_browser_json(url, params=params, label=label)
 
             backoff *= 2
 
@@ -387,7 +508,7 @@ class FaceitAPI:
         url = f"{FACEIT_STATS_BASE}/cs2/players/{player_id}/match-rounds"
         data = await self._get_public_json(
             url,
-            params={"gameMode": "5v5", "limit": limit},
+            params={"limit": limit},
             label="statistics.match_rounds",
         )
         out = _extract_recent_ratings(data, limit)
@@ -574,7 +695,10 @@ class FaceitStats(commands.Cog):
                 errors.append(f"{nick}: {e}")
                 return None
 
-        results = await asyncio.gather(*(fetch_one(n) for n in targets))
+        try:
+            results = await asyncio.gather(*(fetch_one(n) for n in targets))
+        finally:
+            await api.close()
         rows = [r for r in results if r is not None]
 
         rows.sort(key=lambda r: (r["elo_num"] is None, -(r["elo_num"] or -1)))

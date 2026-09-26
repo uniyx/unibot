@@ -1,7 +1,8 @@
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from cogs.faceit import (
+    FACEIT_STATS_BASE,
     RATINGS_UNAVAILABLE_NOTE,
     FaceitAPI,
     FaceitRatingsUnavailable,
@@ -93,6 +94,34 @@ class RatingsUnavailableTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(first.exception), RATINGS_UNAVAILABLE_NOTE)
         self.assertEqual(str(second.exception), RATINGS_UNAVAILABLE_NOTE)
         self.assertEqual(get.call_count, 1)
+
+    async def test_rating_cloudflare_uses_browser_fallback_without_game_mode(self):
+        class BlockedResponse:
+            status_code = 403
+            headers = {"cf-mitigated": "challenge"}
+            text = "Cloudflare challenge"
+
+        api = FaceitAPI(None, "test-key", concurrency=1)
+        browser_json = AsyncMock(return_value={"payload": {"cs2": {"matchRounds": []}}})
+        api._get_browser_json = browser_json
+        url = f"{FACEIT_STATS_BASE}/cs2/players/player-id/match-rounds"
+
+        with patch("cogs.faceit.curl_requests.get", return_value=BlockedResponse()):
+            data = await api._get_public_json(
+                url,
+                params={"limit": 30},
+                retries=1,
+                label="statistics.match_rounds",
+            )
+
+        self.assertEqual(data, {"payload": {"cs2": {"matchRounds": []}}})
+        browser_json.assert_awaited_once_with(
+            url,
+            params={"limit": 30},
+            label="statistics.match_rounds",
+        )
+        self.assertTrue(api._public_browser_only)
+        self.assertFalse(api._public_unavailable)
 
 
 if __name__ == "__main__":
