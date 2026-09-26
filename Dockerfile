@@ -16,7 +16,8 @@ RUN apt-get update \
 
 # ---- Python deps first for layer caching
 COPY requirements.txt /app/requirements.txt
-RUN python -m pip install --no-cache-dir -r /app/requirements.txt
+RUN python -m pip install --no-cache-dir -r /app/requirements.txt \
+ && python -m playwright install-deps chromium
 
 # ---- App source
 COPY . /app
