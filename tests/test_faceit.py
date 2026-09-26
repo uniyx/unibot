@@ -1,6 +1,7 @@
 import unittest
 from unittest.mock import AsyncMock, patch
 
+import cogs.faceit as faceit_module
 from cogs.faceit import (
     FACEIT_STATS_BASE,
     RATINGS_UNAVAILABLE_NOTE,
@@ -119,11 +120,44 @@ class RatingsUnavailableTests(unittest.IsolatedAsyncioTestCase):
             url,
             params={"limit": 30},
             label="statistics.match_rounds",
+            retries=1,
         )
         self.assertTrue(api._public_browser_only)
         self.assertFalse(api._public_unavailable)
 
+    async def test_browser_retries_rate_limit(self):
+        api = FaceitAPI(None, "test-key", concurrency=1)
+        api._public_request_interval = 0
+        page = type("Page", (), {})()
+        page.evaluate = AsyncMock(
+            side_effect=[
+                {
+                    "status": 429,
+                    "retry_after": "0",
+                    "cf_mitigated": "",
+                    "body": "rate limited",
+                },
+                {
+                    "status": 200,
+                    "retry_after": "",
+                    "cf_mitigated": "",
+                    "body": '{"ok": true}',
+                },
+            ]
+        )
+        api._browser_page = page
+
+        result = await api._get_browser_json(
+            "https://example.test/ratings",
+            retries=2,
+            label="statistics.match_rounds",
+        )
+
+        self.assertEqual(result, {"ok": True})
+        self.assertEqual(page.evaluate.await_count, 2)
+
     async def test_recent_ratings_passes_limit_once(self):
+        faceit_module._RECENT_RATINGS_CACHE.clear()
         api = FaceitAPI(None, "test-key", concurrency=1)
         api._get_public_json = AsyncMock(return_value={"payload": {"cs2": {"matchRounds": []}}})
 
@@ -135,6 +169,20 @@ class RatingsUnavailableTests(unittest.IsolatedAsyncioTestCase):
             params={"limit": 30},
             label="statistics.match_rounds",
         )
+
+    async def test_recent_ratings_reuses_short_process_cache(self):
+        faceit_module._RECENT_RATINGS_CACHE.clear()
+        payload = {"payload": {"cs2": {"matchRounds": []}}}
+        first = FaceitAPI(None, "test-key", concurrency=1)
+        second = FaceitAPI(None, "test-key", concurrency=1)
+        first._get_public_json = AsyncMock(return_value=payload)
+        second._get_public_json = AsyncMock()
+
+        await first.get_recent_ratings_batch("cached-player", limit=30)
+        result = await second.get_recent_ratings_batch("cached-player", limit=30)
+
+        self.assertEqual(result["matches_count"], 0)
+        second._get_public_json.assert_not_awaited()
 
 
 if __name__ == "__main__":

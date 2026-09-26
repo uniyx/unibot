@@ -1,6 +1,7 @@
 # cogs/faceit.py
 import asyncio
 import json
+import time
 from contextlib import suppress
 from html import unescape
 from statistics import mean
@@ -21,6 +22,8 @@ from core.faceit_utils import FACEIT_BASE_V4
 FACEIT_BASE = FACEIT_BASE_V4
 FACEIT_STATS_BASE = "https://www.faceit.com/api/statistics/v1"
 RATINGS_UNAVAILABLE_NOTE = "FACEIT Rating is unavailable; other Data API stats are still shown."
+RATINGS_CACHE_TTL_SECONDS = 60.0
+_RECENT_RATINGS_CACHE: Dict[Tuple[str, int], Tuple[float, Dict[str, Any]]] = {}
 
 _BROWSER_FETCH_SCRIPT = """
 async (url) => {
@@ -33,6 +36,7 @@ async (url) => {
         status: response.status,
         content_type: response.headers.get("content-type"),
         cf_mitigated: response.headers.get("cf-mitigated"),
+        retry_after: response.headers.get("retry-after"),
         body: await response.text()
     };
 }
@@ -179,7 +183,7 @@ class FaceitAPI:
         # not the Data API. Keep these calls out of the general request burst.
         self._public_lock = asyncio.Lock()
         self._public_next_request = 0.0
-        self._public_request_interval = 1.1
+        self._public_request_interval = 1.25
         self._public_unavailable = False
         self._public_browser_only = False
         self._browser_lock = asyncio.Lock()
@@ -250,6 +254,7 @@ class FaceitAPI:
         params: Optional[dict] = None,
         *,
         label: str = "unknown",
+        retries: int = 3,
     ) -> dict:
         try:
             from cloakbrowser import launch_async
@@ -259,6 +264,8 @@ class FaceitAPI:
 
         query = urlencode(params or {})
         request_url = f"{url}?{query}" if query else url
+        attempts = max(1, int(retries))
+        backoff = 5.0
 
         async with self._browser_lock:
             if self._public_unavailable:
@@ -279,25 +286,44 @@ class FaceitAPI:
                         timeout=60_000,
                     )
 
-                loop = asyncio.get_running_loop()
-                delay = self._public_next_request - loop.time()
-                if delay > 0:
-                    await asyncio.sleep(delay)
+                for attempt in range(attempts):
+                    loop = asyncio.get_running_loop()
+                    delay = self._public_next_request - loop.time()
+                    if delay > 0:
+                        await asyncio.sleep(delay)
 
-                self.counter.inc(label)
-                result = await self._browser_page.evaluate(
-                    _BROWSER_FETCH_SCRIPT,
-                    request_url,
-                )
-                if not isinstance(result, dict):
-                    raise RuntimeError("FACEIT browser request returned malformed data")
+                    self.counter.inc(label)
+                    result = await self._browser_page.evaluate(
+                        _BROWSER_FETCH_SCRIPT,
+                        request_url,
+                    )
+                    if not isinstance(result, dict):
+                        raise RuntimeError("FACEIT browser request returned malformed data")
 
-                status = int(result.get("status") or 0)
-                response_text = str(result.get("body") or "")
-                response_headers = {
-                    "cf-mitigated": result.get("cf_mitigated") or "",
-                }
-                self._public_next_request = loop.time() + self._public_request_interval
+                    status = int(result.get("status") or 0)
+                    response_text = str(result.get("body") or "")
+                    response_headers = {
+                        "cf-mitigated": result.get("cf_mitigated") or "",
+                        "retry-after": result.get("retry_after") or "",
+                    }
+                    self._public_next_request = loop.time() + self._public_request_interval
+
+                    if status == 429 and attempt < attempts - 1:
+                        try:
+                            wait = (
+                                max(float(response_headers["retry-after"]), self._public_request_interval)
+                                if response_headers["retry-after"]
+                                else backoff
+                            )
+                        except (TypeError, ValueError):
+                            wait = backoff
+                        self._public_next_request = max(
+                            self._public_next_request,
+                            loop.time() + wait,
+                        )
+                        backoff *= 2
+                        continue
+                    break
             except FaceitRatingsUnavailable:
                 raise
             except Exception as exc:
@@ -409,7 +435,12 @@ class FaceitAPI:
                         raise RuntimeError(f"FACEIT GET {url} failed [{status}]{suffix}")
 
             if use_browser:
-                return await self._get_browser_json(url, params=params, label=label)
+                return await self._get_browser_json(
+                    url,
+                    params=params,
+                    label=label,
+                    retries=retries,
+                )
 
             backoff *= 2
 
@@ -509,6 +540,15 @@ class FaceitAPI:
         if cache_key in self._cache_recent_ratings:
             return self._cache_recent_ratings[cache_key]
 
+        cached = _RECENT_RATINGS_CACHE.get(cache_key)
+        if cached is not None:
+            cached_at, cached_value = cached
+            if time.monotonic() - cached_at < RATINGS_CACHE_TTL_SECONDS:
+                out = dict(cached_value)
+                self._cache_recent_ratings[cache_key] = out
+                return out
+            _RECENT_RATINGS_CACHE.pop(cache_key, None)
+
         url = f"{FACEIT_STATS_BASE}/cs2/players/{player_id}/match-rounds"
         data = await self._get_public_json(
             url,
@@ -517,6 +557,7 @@ class FaceitAPI:
         )
         out = _extract_recent_ratings(data, limit)
         self._cache_recent_ratings[cache_key] = out
+        _RECENT_RATINGS_CACHE[cache_key] = (time.monotonic(), dict(out))
         return out
 
     async def get_global_ranking(
