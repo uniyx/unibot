@@ -266,7 +266,11 @@ class FaceitAPI:
 
             try:
                 if self._browser_page is None:
-                    self._browser = await launch_async(headless=True, humanize=False)
+                    self._browser = await launch_async(
+                        headless=True,
+                        humanize=False,
+                        args=["--disable-dev-shm-usage"],
+                    )
                     self._browser_context = await self._browser.new_context()
                     self._browser_page = await self._browser_context.new_page()
                     await self._browser_page.goto(
