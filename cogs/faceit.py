@@ -509,7 +509,7 @@ class FaceitAPI:
         if cache_key in self._cache_recent_ratings:
             return self._cache_recent_ratings[cache_key]
 
-        url = f"{FACEIT_STATS_BASE}/cs2/players/{player_id}/match-rounds?limit=30"
+        url = f"{FACEIT_STATS_BASE}/cs2/players/{player_id}/match-rounds"
         data = await self._get_public_json(
             url,
             params={"limit": limit},

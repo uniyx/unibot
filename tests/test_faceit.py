@@ -123,6 +123,19 @@ class RatingsUnavailableTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(api._public_browser_only)
         self.assertFalse(api._public_unavailable)
 
+    async def test_recent_ratings_passes_limit_once(self):
+        api = FaceitAPI(None, "test-key", concurrency=1)
+        api._get_public_json = AsyncMock(return_value={"payload": {"cs2": {"matchRounds": []}}})
+
+        result = await api.get_recent_ratings_batch("player-id", limit=30)
+
+        self.assertEqual(result["matches_count"], 0)
+        api._get_public_json.assert_awaited_once_with(
+            f"{FACEIT_STATS_BASE}/cs2/players/player-id/match-rounds",
+            params={"limit": 30},
+            label="statistics.match_rounds",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
