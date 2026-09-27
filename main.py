@@ -76,6 +76,7 @@ class UniBot(commands.Bot):
             "cogs.lastfm",
             "cogs.cam",
             "cogs.inv",
+            "cogs.paycheck",
         ]
 
     async def setup_hook(self) -> None:
