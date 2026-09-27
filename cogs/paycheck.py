@@ -1,9 +1,7 @@
-"""Discord presentation and bounded live refreshes for /paycheck."""
+"""Discord presentation for the /paycheck snapshot command."""
 
 from __future__ import annotations
 
-import asyncio
-import logging
 from datetime import date, datetime, timedelta
 from decimal import Decimal, ROUND_HALF_UP
 
@@ -14,10 +12,10 @@ from discord.ext import commands
 from core.discord_utils import guilds_decorator
 from core.paycheck import (
     EMPLOYMENT_START,
-    LIVE_REFRESH_SECONDS,
-    LIVE_UPDATE_SECONDS,
     PAYCHECK_GROSS,
     PAY_TIMEZONE,
+    WORKDAY_END,
+    WORKDAY_START,
     calculate_estimated_net,
     calculate_estimated_tax,
     calculate_period_earnings,
@@ -31,7 +29,6 @@ from core.paycheck import (
 )
 
 
-logger = logging.getLogger(__name__)
 GUILDS = guilds_decorator()
 _FILLED = "\N{FULL BLOCK}"
 _EMPTY = "\N{LIGHT SHADE}"
@@ -83,8 +80,11 @@ def build_paycheck_embed(timestamp: datetime) -> discord.Embed:
     elif is_earning_time(now):
         status = "\N{LARGE GREEN CIRCLE} EARNING"
         color = discord.Color.green()
-    else:
+    elif now.weekday() >= 5:
         status = "\N{DOUBLE VERTICAL BAR}\N{VARIATION SELECTOR-16} WEEKEND / PAUSED"
+        color = discord.Color.gold()
+    else:
+        status = "\N{DOUBLE VERTICAL BAR}\N{VARIATION SELECTOR-16} OUTSIDE WORK HOURS"
         color = discord.Color.gold()
 
     period_end_date = period.end.date() - timedelta(days=1)
@@ -118,7 +118,8 @@ def build_paycheck_embed(timestamp: datetime) -> discord.Embed:
             f"Second            {_rate(rate, 8)}/sec\n"
             f"Minute            {_rate(rate * Decimal(60), 5)}/min\n"
             f"Hour              {_rate(rate * Decimal(3600), 2)}/hr\n"
-            f"Weekday           {_money(rate * Decimal(86400))}\n"
+            f"Workday           {_money(rate * Decimal(8 * 60 * 60))}\n"
+            f"Schedule          {WORKDAY_START.strftime('%H:%M')} - {WORKDAY_END.strftime('%H:%M')} ET\n"
             f"Eligible weekdays {count_weekdays(period)}"
         ),
         inline=True,
@@ -131,49 +132,21 @@ def build_paycheck_embed(timestamp: datetime) -> discord.Embed:
         ),
         inline=True,
     )
-    embed.set_footer(text="Updates every 3s for 60s • Gross based on actual paycheck")
+    embed.set_footer(text="Snapshot at invocation • Gross based on actual paycheck")
     return embed
 
 
 class PaycheckCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
         self.bot = bot
-        self._live_tasks: set[asyncio.Task[None]] = set()
-
-    def cog_unload(self) -> None:
-        for task in self._live_tasks:
-            task.cancel()
-        self._live_tasks.clear()
 
     @GUILDS
-    @app_commands.command(name="paycheck", description="Show live paycheck accrual.")
+    @app_commands.command(name="paycheck", description="Show paycheck accrual now.")
     async def paycheck(self, interaction: discord.Interaction) -> None:
+        now = datetime.now(PAY_TIMEZONE)
         await interaction.response.send_message(
-            embed=build_paycheck_embed(datetime.now(PAY_TIMEZONE))
+            embed=build_paycheck_embed(now)
         )
-        task = asyncio.create_task(self._refresh(interaction))
-        self._live_tasks.add(task)
-        task.add_done_callback(self._live_tasks.discard)
-
-    async def _refresh(self, interaction: discord.Interaction) -> None:
-        deadline = asyncio.get_running_loop().time() + LIVE_UPDATE_SECONDS
-        try:
-            while True:
-                remaining = deadline - asyncio.get_running_loop().time()
-                if remaining <= 0:
-                    break
-                await asyncio.sleep(min(LIVE_REFRESH_SECONDS, remaining))
-                await interaction.edit_original_response(
-                    embed=build_paycheck_embed(datetime.now(PAY_TIMEZONE))
-                )
-                if asyncio.get_running_loop().time() >= deadline:
-                    break
-        except asyncio.CancelledError:
-            raise
-        except discord.NotFound:
-            logger.info("Paycheck message was deleted before live updates finished")
-        except discord.HTTPException:
-            logger.warning("Stopping paycheck live updates after a Discord error", exc_info=True)
 
 
 async def setup(bot: commands.Bot) -> None:

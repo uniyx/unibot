@@ -15,10 +15,10 @@ PAYCHECK_GROSS = Decimal("3175.00")
 PAYCHECK_TAX = Decimal("718.68")
 PAYCHECK_NET = Decimal("2456.32")
 
-LIVE_UPDATE_SECONDS = 60
-LIVE_REFRESH_SECONDS = 3
+WORKDAY_START = time(9, 0)
+WORKDAY_END = time(17, 0)
+WORKDAY_SECONDS = Decimal(8 * 60 * 60)
 
-_SECONDS_PER_DAY = Decimal(86400)
 _MONEY_PRECISION = 50
 
 
@@ -93,7 +93,7 @@ def count_weekdays(period: PayPeriod) -> int:
 
 
 def count_eligible_duration(start: datetime, end: datetime) -> Decimal:
-    """Return eligible local wall-clock seconds between two timestamps."""
+    """Return scheduled local work seconds between two timestamps."""
 
     start_local = to_pay_timezone(start).replace(tzinfo=None)
     end_local = to_pay_timezone(end).replace(tzinfo=None)
@@ -104,8 +104,8 @@ def count_eligible_duration(start: datetime, end: datetime) -> Decimal:
     current_day = start_local.date()
     last_day = end_local.date()
     while current_day <= last_day:
-        day_start = datetime.combine(current_day, time.min)
-        day_end = day_start + timedelta(days=1)
+        day_start = datetime.combine(current_day, WORKDAY_START)
+        day_end = datetime.combine(current_day, WORKDAY_END)
         segment_start = max(start_local, day_start)
         segment_end = min(end_local, day_end)
         if current_day.weekday() < 5 and segment_end > segment_start:
@@ -120,11 +120,11 @@ def count_eligible_duration(start: datetime, end: datetime) -> Decimal:
 def get_period_rate(period: PayPeriod) -> Decimal:
     """Return gross dollars per eligible second for ``period``.
 
-    Each period gets its own rate so all eligible weekday seconds in that
-    period sum to exactly the authoritative $3,175.00 gross paycheck.
+    Each period gets its own rate so all scheduled weekday work seconds in
+    that period sum to exactly the authoritative $3,175.00 gross paycheck.
     """
 
-    eligible_seconds = Decimal(count_weekdays(period)) * _SECONDS_PER_DAY
+    eligible_seconds = Decimal(count_weekdays(period)) * WORKDAY_SECONDS
     if not eligible_seconds:
         return Decimal(0)
     with localcontext() as context:
@@ -199,7 +199,11 @@ def calculate_estimated_net(gross: Decimal) -> Decimal:
 
 
 def is_earning_time(timestamp: datetime) -> bool:
-    """Return whether weekday accrual is active at ``timestamp``."""
+    """Return whether scheduled weekday accrual is active at ``timestamp``."""
 
     local = to_pay_timezone(timestamp)
-    return local >= EMPLOYMENT_START and local.weekday() < 5
+    return (
+        local >= EMPLOYMENT_START
+        and local.weekday() < 5
+        and WORKDAY_START <= local.time() < WORKDAY_END
+    )

@@ -9,6 +9,7 @@ from core.paycheck import (
     PAYCHECK_NET,
     PAYCHECK_TAX,
     PAY_TIMEZONE,
+    WORKDAY_SECONDS,
     calculate_estimated_net,
     calculate_estimated_tax,
     calculate_period_earnings,
@@ -41,29 +42,45 @@ class PaycheckCalculationTests(unittest.TestCase):
 
         self.assertEqual(count_weekdays(period), 11)
         self.assertEqual(calculate_period_earnings(period, period.end), PAYCHECK_GROSS)
-        self.assertEqual(
-            get_period_rate(period) * Decimal(count_weekdays(period) * 86400),
-            PAYCHECK_GROSS,
-        )
+        with localcontext() as context:
+            context.prec = 50
+            self.assertAlmostEqual(
+                get_period_rate(period) * Decimal(count_weekdays(period)) * WORKDAY_SECONDS,
+                PAYCHECK_GROSS,
+                places=45,
+            )
 
     def test_weekend_freezes_at_saturday_midnight(self):
         period = get_pay_period(eastern(2026, 9, 3))
-        friday = calculate_period_earnings(period, eastern(2026, 9, 4, 23, 59, 59))
+        friday = calculate_period_earnings(period, eastern(2026, 9, 4, 16, 59, 59))
+        friday_end = calculate_period_earnings(period, eastern(2026, 9, 4, 17))
         saturday = calculate_period_earnings(period, eastern(2026, 9, 5))
         sunday = calculate_period_earnings(period, eastern(2026, 9, 6, 23, 59, 59))
 
         self.assertGreater(friday, Decimal(0))
+        self.assertEqual(friday_end, saturday)
         self.assertEqual(saturday, sunday)
         self.assertEqual(count_eligible_duration(eastern(2026, 9, 5), eastern(2026, 9, 7)), Decimal(0))
         self.assertFalse(is_earning_time(eastern(2026, 9, 5)))
 
-    def test_monday_resumes_after_weekend(self):
+    def test_monday_resumes_at_nine(self):
         period = get_pay_period(eastern(2026, 9, 3))
         sunday = calculate_period_earnings(period, eastern(2026, 9, 6, 23, 59, 59))
-        monday = calculate_period_earnings(period, eastern(2026, 9, 7, 0, 0, 1))
+        monday_before_work = calculate_period_earnings(period, eastern(2026, 9, 7, 8, 59, 59))
+        monday = calculate_period_earnings(period, eastern(2026, 9, 7, 9, 0, 1))
 
+        self.assertEqual(monday_before_work, sunday)
         self.assertGreater(monday, sunday)
-        self.assertTrue(is_earning_time(eastern(2026, 9, 7)))
+        self.assertFalse(is_earning_time(eastern(2026, 9, 7, 8, 59, 59)))
+        self.assertTrue(is_earning_time(eastern(2026, 9, 7, 9)))
+
+    def test_overnight_is_paused_after_workday(self):
+        period = get_pay_period(eastern(2026, 9, 3))
+        friday_end = calculate_period_earnings(period, eastern(2026, 9, 4, 17))
+        friday_night = calculate_period_earnings(period, eastern(2026, 9, 4, 23, 59, 59))
+
+        self.assertEqual(friday_end, friday_night)
+        self.assertFalse(is_earning_time(eastern(2026, 9, 4, 17)))
 
     def test_weekday_counts_change_rates(self):
         ten_weekday_period = get_pay_period(eastern(2026, 8, 1))
@@ -90,7 +107,8 @@ class PaycheckCalculationTests(unittest.TestCase):
         self.assertEqual(calculate_total_gross(eastern(2026, 7, 31, 23, 59, 59)), Decimal(0))
         self.assertEqual(calculate_total_gross(EMPLOYMENT_START), Decimal(0))
         self.assertEqual(calculate_total_gross(eastern(2026, 8, 2, 23, 59, 59)), Decimal(0))
-        self.assertGreater(calculate_total_gross(eastern(2026, 8, 3, 0, 0, 1)), Decimal(0))
+        self.assertEqual(calculate_total_gross(eastern(2026, 8, 3, 8, 59, 59)), Decimal(0))
+        self.assertGreater(calculate_total_gross(eastern(2026, 8, 3, 9, 0, 1)), Decimal(0))
 
     def test_calendar_edges(self):
         february = get_pay_period(eastern(2027, 2, 28, 12))
@@ -146,7 +164,7 @@ class PaycheckPresentationTests(unittest.TestCase):
         self.assertEqual(progress_bar(Decimal("100")), "█" * 20 + " 100.00%")
         self.assertEqual(progress_bar(Decimal("150")).count("█"), 20)
 
-    def test_embed_contains_live_tracker_sections(self):
+    def test_embed_contains_paycheck_sections(self):
         embed = build_paycheck_embed(eastern(2026, 9, 21, 12))
         fields = {field.name: field.value for field in embed.fields}
 
@@ -154,14 +172,23 @@ class PaycheckPresentationTests(unittest.TestCase):
         self.assertIn("Gross", fields["Total earned"])
         self.assertIn("Progress", fields["Current paycheck"])
         self.assertIn("Second", fields["Current rate"])
+        self.assertIn("Workday", fields["Current rate"])
+        self.assertIn("09:00 - 17:00 ET", fields["Current rate"])
         self.assertIn("September 30, 2026", fields["Next paycheck"])
         self.assertIn("EARNING", fields["Next paycheck"])
+        self.assertIn("Snapshot at invocation", embed.footer.text)
 
     def test_weekend_embed_reports_paused_status(self):
         embed = build_paycheck_embed(eastern(2026, 9, 19, 12))
         next_field = next(field.value for field in embed.fields if field.name == "Next paycheck")
 
         self.assertIn("WEEKEND / PAUSED", next_field)
+
+    def test_after_hours_embed_reports_work_hours_status(self):
+        embed = build_paycheck_embed(eastern(2026, 9, 21, 18))
+        next_field = next(field.value for field in embed.fields if field.name == "Next paycheck")
+
+        self.assertIn("OUTSIDE WORK HOURS", next_field)
 
 
 if __name__ == "__main__":
