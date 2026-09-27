@@ -136,13 +136,7 @@ def build_player_status(api_key: str, player_id: str, counter: ApiCounter) -> di
             "nickname": resolved_name,
             "playerId": str(resolved_player_id),
             "active": True,
-            "source": "groupByState",
             "matchId": ongoing_match.get("id"),
-            "status": ongoing_match.get("status") or ongoing_match.get("state"),
-            "competitionName": ongoing_match.get("competition_name")
-            or ongoing_match.get("entity", {}).get("name"),
-            "queueId": ongoing_match.get("entityCustom", {}).get("queueId"),
-            "createdAt": to_iso8601_utc(ongoing_match.get("createdAt")),
         }
 
     recent_match_id = fetch_recent_match_id(
@@ -156,8 +150,6 @@ def build_player_status(api_key: str, player_id: str, counter: ApiCounter) -> di
             "nickname": resolved_name,
             "playerId": str(resolved_player_id),
             "active": False,
-            "source": "history",
-            "message": "No recent matches found.",
         }
 
     match_details = fetch_match_details(api_key, recent_match_id, counter)
@@ -167,10 +159,7 @@ def build_player_status(api_key: str, player_id: str, counter: ApiCounter) -> di
         "nickname": resolved_name,
         "playerId": str(resolved_player_id),
         "active": False,
-        "source": "history",
         "matchId": recent_match_id,
-        "status": match_details.get("status"),
-        "competitionName": match_details.get("competition_name"),
         "finishedAt": to_iso8601_utc(finished_at),
     }
 
@@ -248,12 +237,10 @@ class Banlist(commands.Cog):
             )
             return
 
-        if add:
-            await self._handle_add(interaction, api_key, add.strip())
-            return
-
-        if remove:
-            await self._handle_remove(interaction, api_key, remove.strip())
+        if add or remove:
+            await self._handle_change(
+                interaction, api_key, (add or remove).strip(), adding=bool(add)
+            )
             return
 
         with self.db_lock:
@@ -326,11 +313,13 @@ class Banlist(commands.Cog):
         embed.set_footer(text=f"Tracked players: {len(players)} | Total FACEIT API calls: {counter.value}")
         await interaction.followup.send(embed=embed)
 
-    async def _handle_add(
+    async def _handle_change(
         self,
         interaction: discord.Interaction,
         api_key: str,
         nickname: str,
+        *,
+        adding: bool,
     ) -> None:
         counter = ApiCounter()
 
@@ -354,57 +343,25 @@ class Banlist(commands.Cog):
         resolved_name = resolve_player_nickname(player, fallback=nickname)
 
         with self.db_lock:
-            created = _upsert_player(self.conn, str(player_id), str(resolved_name))
+            if adding:
+                created = _upsert_player(self.conn, str(player_id), str(resolved_name))
+                description = f"{'Added' if created else 'Updated'} `{resolved_name}` with player ID `{player_id}`."
+            else:
+                removed = _remove_player_by_id(self.conn, str(player_id))
 
-        verb = "Added" if created else "Updated"
-        embed = discord.Embed(
-            title="FACEIT Banlist",
-            description=f"{verb} `{resolved_name}` with player ID `{player_id}`.",
-            color=THEME_COLOR,
-        )
-        embed.set_footer(text=f"Total FACEIT API calls: {counter.value}")
-        await interaction.followup.send(embed=embed)
-
-    async def _handle_remove(
-        self,
-        interaction: discord.Interaction,
-        api_key: str,
-        nickname: str,
-    ) -> None:
-        counter = ApiCounter()
-
-        try:
-            player = await asyncio.to_thread(fetch_player_by_nickname, api_key, nickname, counter)
-        except Exception as exc:
-            await interaction.followup.send(
-                f"Failed to resolve `{nickname}` on FACEIT: {exc}",
-                ephemeral=True,
-            )
-            return
-
-        try:
-            player_id = resolve_player_id(player, fallback=nickname)
-        except Exception:
-            await interaction.followup.send(
-                f"FACEIT did not return a player ID for `{nickname}`.",
-                ephemeral=True,
-            )
-            return
-        resolved_name = resolve_player_nickname(player, fallback=nickname)
-
-        with self.db_lock:
-            removed = _remove_player_by_id(self.conn, str(player_id))
-
-        if not removed:
+        if not adding and not removed:
             await interaction.followup.send(
                 f"`{resolved_name}` is not currently in the banlist.",
                 ephemeral=True,
             )
             return
 
+        if not adding:
+            description = f"Removed `{resolved_name}` with player ID `{player_id}`."
+
         embed = discord.Embed(
             title="FACEIT Banlist",
-            description=f"Removed `{resolved_name}` with player ID `{player_id}`.",
+            description=description,
             color=THEME_COLOR,
         )
         embed.set_footer(text=f"Total FACEIT API calls: {counter.value}")

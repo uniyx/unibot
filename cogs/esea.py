@@ -57,12 +57,6 @@ def _now_local() -> dt.datetime:
 def _now_unix() -> int:
     return int(_now_local().timestamp())
 
-def _ms_to_local(ms: Optional[int]) -> str:
-    if not ms:
-        return "TBD"
-    dtu = dt.datetime.fromtimestamp(int(ms) / 1000.0, dt.timezone.utc)
-    return dtu.astimezone(ZoneInfo(OUTPUT_TZ)).strftime("%a %b %d, %Y %H:%M %Z")
-
 def _alert_at_unix(sched_ms: int) -> int:
     # alert time is schedule minus lead minutes
     start_unix = int(sched_ms // 1000)
@@ -408,8 +402,6 @@ class FaceitV1Client:
             out.append({
                 "match_id": match_id,
                 "scheduled_ms": sched_ms,
-                "scheduled_local": _ms_to_local(sched_ms),
-                "opponent_id": opp_id,
                 "opponent_name": opp_name,
                 "match_url": f"{FACEIT_ROOM_BASE}/{match_id}" if match_id else "",
             })

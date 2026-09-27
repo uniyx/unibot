@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import datetime as dt
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Optional
 from urllib.parse import quote
 
 import aiohttp
@@ -253,14 +253,11 @@ async def fetch_json(
     headers: Optional[dict[str, str]] = None,
     params: Optional[dict[str, Any]] = None,
     timeout: int = 10,
-    error_factory: Optional[Callable[[str], Exception]] = None,
 ) -> Any:
     async with session.get(url, headers=headers, params=params, timeout=timeout) as response:
         if response.status != 200:
             text = await response.text()
             message = f"HTTP {response.status} for {url}: {text[:200]}"
-            if error_factory:
-                raise error_factory(message)
             raise FaceitApiError(message)
         return await response.json()
 
@@ -269,8 +266,6 @@ async def resolve_player_id_async(
     session: aiohttp.ClientSession,
     api_key: str,
     nickname: str,
-    *,
-    error_factory: Optional[Callable[[str], Exception]] = None,
 ) -> str:
     data = await fetch_json(
         session,
@@ -278,12 +273,8 @@ async def resolve_player_id_async(
         headers=build_auth_headers(api_key),
         params={"nickname": nickname},
         timeout=10,
-        error_factory=error_factory,
     )
     player_id = data.get("player_id")
     if not player_id:
-        message = f"Could not resolve FACEIT player_id for nickname '{nickname}'"
-        if error_factory:
-            raise error_factory(message)
-        raise FaceitApiError(message)
+        raise FaceitApiError(f"Could not resolve FACEIT player_id for nickname '{nickname}'")
     return str(player_id)

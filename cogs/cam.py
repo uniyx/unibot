@@ -1,5 +1,4 @@
 # cogs/camera.py
-import os
 import io
 import asyncio
 import contextlib

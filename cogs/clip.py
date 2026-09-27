@@ -29,7 +29,6 @@ async def get_player_id(session: aiohttp.ClientSession, nickname: str) -> str:
         session,
         FACEIT_API_KEY,
         nickname,
-        error_factory=FaceitApiError,
     )
 
 

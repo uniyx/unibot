@@ -37,7 +37,6 @@ MONTHLY_KILLS_COL_IDX = 3
 
 MONTHLY_GOAL_KILLS = 6000
 DAILY_TARGET_KILLS = 200
-ASSUMED_DAYS_PER_MONTH = 30
 OUTPUT_TZ = ZoneInfo("America/New_York")
 EMBED_COLOR = 0x0C9547
 
@@ -187,11 +186,6 @@ def format_table_pretty(rows: List[Tuple[str, int, int, int]], server_count: int
     label_to_medal: Dict[str, str] = {name: _medal(i + 1) for i, (name, _, _, _) in enumerate(sorted_by_kills)}
 
     name_w = max(5, max(len(r[0]) for r in rows) if rows else 5)
-    header = (
-        f"**🏆 Warmup Monthly Progress**\n"
-        f"Servers: **{server_count}** • Goal: **{MONTHLY_GOAL_KILLS}** • Target/day: **{DAILY_TARGET_KILLS}** • "
-        f"{now.strftime('%a %b %d, %Y %H:%M %Z')}\n\n"
-    )
     # Include the sign when sizing the delta values so four-digit deficits do
     # not push their progress bars one character out of alignment.
     delta_value_w = max(4, max((len(f"{row[3]:+d}") for row in rows), default=0))

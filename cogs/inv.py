@@ -1,6 +1,5 @@
 # cogs/inv.py
 
-import os
 import re
 import json
 from pathlib import Path

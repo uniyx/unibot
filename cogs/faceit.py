@@ -22,7 +22,7 @@ from core.faceit_utils import FACEIT_BASE_V4
 FACEIT_BASE = FACEIT_BASE_V4
 FACEIT_STATS_BASE = "https://www.faceit.com/api/statistics/v1"
 RATINGS_UNAVAILABLE_NOTE = "FACEIT Rating is unavailable; other Data API stats are still shown."
-RATINGS_CACHE_TTL_SECONDS = 60.0
+RATINGS_CACHE_TTL_SECONDS = 15.0
 _RECENT_RATINGS_CACHE: Dict[Tuple[str, int], Tuple[float, Dict[str, Any]]] = {}
 
 _BROWSER_FETCH_SCRIPT = """

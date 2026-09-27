@@ -3,10 +3,10 @@
 import io
 import math
 import asyncio
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import aiohttp
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
 
 import discord
 from discord import app_commands
@@ -92,7 +92,9 @@ def _pick_image_url(album: Dict) -> Optional[str]:
             return im["#text"]
     return None
 
-async def _fetch_image(session: aiohttp.ClientSession, url: str) -> Optional[Image.Image]:
+async def _fetch_image(session: aiohttp.ClientSession, url: Optional[str]) -> Optional[Image.Image]:
+    if not url:
+        return None
     try:
         async with session.get(url, timeout=aiohttp.ClientTimeout(total=20)) as r:
             if r.status != 200:
@@ -150,9 +152,9 @@ async def _make_album_grid(
     limit: int,
     cols: int,
     cell_px: int,
-) -> Tuple[Image.Image, List[str]]:
+) -> Image.Image:
     """
-    Builds the grid image and returns it along with a list of album titles for the footer.
+    Builds the grid image.
     """
     period = _PERIOD_MAP[period_label]
     async with aiohttp.ClientSession(headers={"User-Agent": "uniyx-lastfm-cog/1.0"}) as session:
@@ -162,33 +164,13 @@ async def _make_album_grid(
 
         # Choose cover URLs and fetch concurrently
         urls: List[Optional[str]] = [_pick_image_url(a) for a in albums]
-        tasks = [(_fetch_image(session, u) if u else None) for u in urls]
-
-        # Launch only actual tasks
-        fetched: List[Optional[Image.Image]] = []
-        if any(t is not None for t in tasks):
-            results = await asyncio.gather(*[t for t in tasks if t is not None], return_exceptions=True)
-            # Reinterleave results back into original positions
-            it = iter(results)
-            for t in tasks:
-                if t is None:
-                    fetched.append(None)
-                else:
-                    val = next(it)
-                    fetched.append(val if isinstance(val, Image.Image) else None)
-        else:
-            fetched = [None] * len(urls)
-
-        tiles: List[Image.Image] = [img if img is not None else _placeholder_tile(cell_px) for img in fetched]
+        fetched = await asyncio.gather(
+            *(_fetch_image(session, url) for url in urls),
+            return_exceptions=True,
+        )
+        tiles = [img if isinstance(img, Image.Image) else _placeholder_tile(cell_px) for img in fetched]
         grid = _compose_grid(tiles, cols=cols, cell=cell_px)
-
-        # Build a list of album labels for the embed footer or caption
-        labels: List[str] = []
-        for a in albums:
-            name = str(a.get("name", "")).strip() or "Unknown Album"
-            artist = str(a.get("artist", {}).get("name", "")).strip() or "Unknown Artist"
-            labels.append(f"{name} — {artist}")
-        return grid, labels
+        return grid
 
 class LastFMCog(commands.Cog):
     def __init__(self, bot: commands.Bot):
@@ -225,7 +207,7 @@ class LastFMCog(commands.Cog):
         cell_size = max(100, min(int(cell_size or 240), 512))
 
         try:
-            grid, labels = await _make_album_grid(
+            grid = await _make_album_grid(
                 username=username,
                 period_label=timespan.value,
                 limit=limit,
